@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ic_background">#101311</color>
+    <style name="Theme.OfflineWallet" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">#101311</item>
+        <item name="android:windowBackground">#101311</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>
