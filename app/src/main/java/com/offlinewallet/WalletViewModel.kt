@@ -2,6 +2,10 @@ package com.offlinewallet
 
 import android.app.Application
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -10,7 +14,14 @@ import androidx.lifecycle.viewModelScope
 import com.offlinewallet.core.Chain
 import com.offlinewallet.core.Envelope
 import com.offlinewallet.core.EthUnsigned
+import com.offlinewallet.core.ChainRef
+import com.offlinewallet.core.ERC20_TRANSFER_GAS
+import com.offlinewallet.core.NATIVE_TRANSFER_GAS
 import com.offlinewallet.core.NetworkId
+import com.offlinewallet.core.asChain
+import com.offlinewallet.core.erc20TransferData
+import com.offlinewallet.core.formatBalance
+import com.offlinewallet.core.nativeUnit
 import com.offlinewallet.core.PayloadKind
 import com.offlinewallet.core.SecretBox
 import com.offlinewallet.core.Utxo
@@ -55,6 +66,29 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.math.BigInteger
 
+data class EvmChainConfig(
+    val wire: String,
+    val title: String,
+    val chainId: Long,
+    val builtin: Boolean,
+)
+
+data class SavedToken(
+    val network: String,
+    val contract: String,
+    val name: String,
+    val symbol: String,
+    val decimals: Int,
+)
+
+data class ChainChoice(
+    val wire: String,
+    val title: String,
+    val chain: Chain,
+    val testNet: Boolean,
+    val detail: String,
+)
+
 data class StoredAccount(
     val address: String,
     val network: String? = null,
@@ -69,7 +103,6 @@ data class StoredAccount(
     fun caption(): String {
         val net = networkId()?.title ?: "未标记网络"
         val type = BtcAddressType.fromWire(kind)?.title
-            ?: if (networkId()?.chain == Chain.EVM) "以太坊地址" else null
         return if (type == null) net else "$net · $type"
     }
 }
@@ -90,6 +123,9 @@ sealed interface Screen {
     data object ShowQr : Screen
     data class Scan(val purpose: ScanPurpose) : Screen
     data object Settings : Screen
+    data object Nodes : Screen
+    data object Tokens : Screen
+    data object EvmNetworks : Screen
     data object Result : Screen
 }
 
@@ -107,6 +143,7 @@ class WalletViewModel(app: Application) : AndroidViewModel(app) {
     var balanceNote by mutableStateOf("")
     var tiers by mutableStateOf<List<FeeChoice>>(emptyList())
     var busy by mutableStateOf(false)
+    var broadcasting by mutableStateOf(false)
     var error by mutableStateOf<String?>(null)
     var info by mutableStateOf<String?>(null)
     var qrTitle by mutableStateOf("")
@@ -119,15 +156,29 @@ class WalletViewModel(app: Application) : AndroidViewModel(app) {
     var resultLink by mutableStateOf<String?>(null)
     var draftRole by mutableStateOf(Role.OFFLINE)
     var spaceLabel by mutableStateOf("主应用")
-    var pendingImportNetwork by mutableStateOf(NetworkId.BITCOIN_TESTNET3)
+    var pendingImportWire by mutableStateOf(NetworkId.BITCOIN_MAINNET.wire)
     var pendingImportNote by mutableStateOf("")
+    var evmChains by mutableStateOf<List<EvmChainConfig>>(emptyList())
+    var savedTokens by mutableStateOf<List<SavedToken>>(emptyList())
+    var chainChoices by mutableStateOf<List<ChainChoice>>(emptyList())
+    var networkFormEpoch by mutableStateOf(0)
+    var tokenFormEpoch by mutableStateOf(0)
     var hasAppPassword by mutableStateOf(false)
+    var updateBusy by mutableStateOf(false)
+    var updateNotice by mutableStateOf<UpdateNotice?>(null)
+    var selectedWire by mutableStateOf<String?>(null)
+    var assetBalance by mutableStateOf("")
+    var assetBalanceNote by mutableStateOf("")
 
     private var reviewPayload = ""
     private var pendingUnsigned: String? = null
     private var scanReturn: Screen = Screen.OfflineHome
     private var refreshGen = 0
     private val endpoints = linkedMapOf<String, String>()
+    private var assetGen = 0
+    private val customEvm = mutableListOf<EvmChainConfig>()
+    private val hiddenEvm = mutableSetOf<String>()
+    private var customChainId: Long? = null
     private var btcUtxos: List<Utxo> = emptyList()
     private var btcSpendable = 0L
     private var ethBalance: BigInteger = BigInteger.ZERO
@@ -136,6 +187,11 @@ class WalletViewModel(app: Application) : AndroidViewModel(app) {
     init {
         role = prefs.getString("role", null)?.let { runCatching { Role.valueOf(it) }.getOrNull() }
         loadEndpoints()
+        loadChains()
+        loadTokens()
+        seedPresets()
+        migrateBscEndpoint()
+        rebuildChains()
         val loaded = loadAccounts()
         val named = withDefaultNotes(loaded)
         accounts = named
@@ -197,20 +253,22 @@ class WalletViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun previewAccounts(raw: String, chosen: NetworkId, kinds: Set<BtcAddressType>): List<Pair<String, String>> {
+    fun previewAccounts(raw: String, wire: String, kinds: Set<BtcAddressType>): List<Pair<String, String>> {
+        val chosen = choice(wire)
         if (chosen.chain == Chain.EVM) {
             val key = importEthPrivateKey(raw)
             key.priv.fill(0)
-            return listOf("以太坊地址" to key.address)
+            return listOf("${chosen.title} 地址" to key.address)
         }
         if (kinds.isEmpty()) throw WalletException("至少选一种地址类型")
-        val key = importWif(raw, chosen)
-        val rows = kinds.map { type -> type.title to bitcoinAddress(key.priv, chosen, type) }
+        val net = NetworkId.fromWire(wire)
+        val key = importWif(raw, net)
+        val rows = kinds.map { type -> type.title to bitcoinAddress(key.priv, net, type) }
         key.priv.fill(0)
         return rows
     }
 
-    fun saveKey(raw: String, chosen: NetworkId, kinds: Set<BtcAddressType>, note: String) {
+    fun saveKey(raw: String, wire: String, kinds: Set<BtcAddressType>, note: String) {
         if (busy) return
         viewModelScope.launch {
             busy = true
@@ -221,15 +279,17 @@ class WalletViewModel(app: Application) : AndroidViewModel(app) {
                     val pass = AppPassword.load(prefs)
                     val label = note.trim().ifBlank { nextAccountLabel() }
                     try {
+                    val chosen = choice(wire)
                     val created = when (chosen.chain) {
                         Chain.BITCOIN -> {
                             if (kinds.isEmpty()) throw WalletException("至少选一种地址类型")
-                            val key = importWif(raw, chosen)
-                            kinds.map { type -> type.title to bitcoinAddress(key.priv, chosen, type) to key }
+                            val net = NetworkId.fromWire(wire)
+                            val key = importWif(raw, net)
+                            kinds.map { type -> type.title to bitcoinAddress(key.priv, net, type) to key }
                         }
                         Chain.EVM -> {
                             val key = importEthPrivateKey(raw)
-                            listOf(("以太坊地址" to key.address) to key)
+                            listOf(("${chosen.title} 地址" to key.address) to key)
                         }
                     }
                     val key = created.first().second
@@ -267,28 +327,38 @@ class WalletViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun importAddress(raw: String, chosen: NetworkId? = pendingImportNetwork, note: String? = pendingImportNote) {
+    fun importAddress(raw: String, chosenWire: String? = pendingImportWire, note: String? = pendingImportNote) {
         try {
             val text = raw.trim()
             if (looksLikePrivateKey(text)) throw WalletException("在线端不能导入私钥")
-            val net: NetworkId
+            val wire: String
+            val chain: Chain
             val body: String
             if (text.startsWith("owtx1:")) {
                 val env = Envelope.decode(text)
                 if (env.kind != PayloadKind.ADDRESS) throw WalletException("这是交易报文，不是地址")
-                net = env.network
+                wire = env.network.wire
+                chain = env.chain
                 body = env.body.trim()
+                if (wire == NetworkId.BITCOIN_TESTNET3.wire || wire == NetworkId.ETHEREUM_SEPOLIA.wire) {
+                    throw WalletException("测试网络已去掉")
+                }
             } else {
-                net = chosen ?: throw WalletException("请先选择网络")
+                val chosen = choice(chosenWire ?: throw WalletException("请先选择网络"))
+                wire = chosen.wire
+                chain = chosen.chain
                 body = text
             }
-            val canonical = canonicalAddress(body, net)
-            if (accounts.any { it.address.equals(canonical, true) && it.network == net.wire }) {
+            val canonical = when (chain) {
+                Chain.BITCOIN -> canonicalAddress(body, NetworkId.fromWire(wire))
+                Chain.EVM -> normalizeEthAddress(body)
+            }
+            if (accounts.any { it.address.equals(canonical, true) && it.network == wire }) {
                 throw WalletException("这个地址已经在观察列表里")
             }
-            val kind = if (net.chain == Chain.BITCOIN) btcScriptType(addressToScript(canonical, net)).wire else null
+            val kind = if (chain == Chain.BITCOIN) btcScriptType(addressToScript(canonical, NetworkId.fromWire(wire))).wire else null
             val label = note?.trim().orEmpty().ifBlank { nextAccountLabel() }
-            val account = StoredAccount(canonical, net.wire, kind, label)
+            val account = StoredAccount(canonical, wire, kind, label)
             accounts = accounts + account
             applyAccount(account)
             persistAccounts()
@@ -302,8 +372,11 @@ class WalletViewModel(app: Application) : AndroidViewModel(app) {
 
     fun showAddressQr() {
         val current = address ?: return
-        val net = network ?: return
-        showQr("观察地址", "给另一台手机扫描。二维码里只有地址。", Envelope(1, PayloadKind.ADDRESS, net.chain, net, current).encode())
+        val net = network ?: run {
+            error = "自定义网络的地址先直接复制"
+            return
+        }
+        showQr("观察地址", "给另一台手机扫描。二维码里只有地址。", Envelope(1, PayloadKind.ADDRESS, net.chain, net.asChain(), current).encode())
     }
 
     fun openScan(purpose: ScanPurpose) {
@@ -322,20 +395,22 @@ class WalletViewModel(app: Application) : AndroidViewModel(app) {
 
     fun select(address: String, networkWire: String?) {
         val account = accounts.find { it.address == address && it.network == networkWire } ?: return
-        if (selectedAddress == account.address && network?.wire == account.network) return
+        if (selectedAddress == account.address && selectedWire == account.network) return
         applyAccount(account)
         prefs.edit().putString("selected", selectionToken(account)).commit()
         error = null
     }
 
     fun removeAccount(address: String, networkWire: String?) {
-        val removingCurrent = selectedAddress == address && network?.wire == networkWire
+        val removingCurrent = selectedAddress == address && selectedWire == networkWire
         accounts = accounts.filterNot { it.address.equals(address, true) && it.network == networkWire }
         if (removingCurrent) {
             val next = accounts.firstOrNull()
             if (next == null) {
                 selectedAddress = null
                 network = null
+                selectedWire = null
+                customChainId = null
                 endpoint = ""
                 clearChainState()
             } else {
@@ -353,7 +428,7 @@ class WalletViewModel(app: Application) : AndroidViewModel(app) {
             val env = Envelope.decode(raw.trim())
             if (env.kind != PayloadKind.UNSIGNED) throw WalletException("请扫描未签名交易")
             if (env.chain == Chain.BITCOIN) {
-                matchBitcoinAccount(decodePsbt(env.body.base64ToBytes()), env.network)
+                matchBitcoinAccount(decodePsbt(env.body.base64ToBytes()), env.network.asNetworkId())
             } else {
                 val matches = accounts.filter { it.network == env.network.wire }
                 if (matches.isEmpty()) throw WalletException("这台手机没有这个网络的私钥")
@@ -391,11 +466,11 @@ class WalletViewModel(app: Application) : AndroidViewModel(app) {
                         val body = when (env.chain) {
                             Chain.BITCOIN -> {
                                 val psbt = decodePsbt(env.body.base64ToBytes())
-                                reviewBitcoin(psbt, address!!, env.network)
+                                reviewBitcoin(psbt, address!!, env.network.asNetworkId())
                                 encodePsbt(signBitcoin(psbt, priv)).toBase64()
                             }
                             Chain.EVM -> {
-                                reviewEthereum(env.body.base64ToBytes(), env.network.ethChainId())
+                                reviewEthereum(env.body.base64ToBytes(), env.network.chainId)
                                 signEthereum(env.body.base64ToBytes(), priv).toBase64()
                             }
                         }
@@ -417,15 +492,19 @@ class WalletViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun refresh() {
-        val net = network ?: return
         val addr = address ?: return
+        val builtin = network
+        val chainId = customChainId
+        if (builtin == null && chainId == null) return
         if (role != Role.ONLINE) return
         val gen = ++refreshGen
         viewModelScope.launch {
             busy = true
             error = null
             try {
-                val snapshot = withContext(Dispatchers.IO) { ChainApi(endpoint).load(net, addr) }
+                val snapshot = withContext(Dispatchers.IO) {
+                    if (builtin != null) ChainApi(endpoint).load(builtin, addr) else ChainApi(endpoint).loadEvm(chainId!!, addr)
+                }
                 if (gen != refreshGen || address != addr) return@launch
                 balance = snapshot.primary
                 balanceNote = snapshot.secondary
@@ -444,17 +523,76 @@ class WalletViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun buildSend(toRaw: String, amountRaw: String, tierIndex: Int) {
+    fun currentTokens(): List<SavedToken> = savedTokens.filter { it.network == selectedWire }
+
+    fun isEvmAccount(): Boolean = network?.chain == Chain.EVM || customChainId != null
+
+    fun nativeCoinSymbol(): String {
+        val id = if (network?.chain == Chain.EVM) network?.ethChainId() else customChainId
+        return if (id != null) nativeUnit(id) else network?.unit ?: ""
+    }
+
+    fun refreshAsset(contract: String?) {
+        val gen = ++assetGen
+        if (!isEvmAccount() || contract == null) {
+            assetBalance = balance
+            assetBalanceNote = ""
+            return
+        }
+        val token = currentTokens().find { it.contract.equals(contract, true) } ?: return
+        val holder = address ?: return
+        val node = endpoint
+        viewModelScope.launch {
+            assetBalance = "正在查询"
+            assetBalanceNote = ""
+            try {
+                val raw = withContext(Dispatchers.IO) { ChainApi(node).tokenBalance(token.contract, holder) }
+                if (gen != assetGen) return@launch
+                assetBalance = "${formatBalance(raw, token.decimals)} ${token.symbol}"
+                assetBalanceNote = "手续费从 ${nativeCoinSymbol()} 余额扣除，当前 $balance"
+            } catch (e: Exception) {
+                if (gen != assetGen) return@launch
+                assetBalance = "余额读取失败"
+                assetBalanceNote = e.message ?: ""
+            }
+        }
+    }
+
+    fun buildSend(toRaw: String, amountRaw: String, tierIndex: Int, tokenContract: String? = null) {
+        if (selectedWire == null) {
+            error = "请先选择账户"
+            return
+        }
+        if (tokenContract != null && !isEvmAccount()) {
+            error = "只有 EVM 网络可以发送代币"
+            return
+        }
         val tier = tiers.getOrNull(tierIndex)
         if (tier == null) {
             error = "请先刷新余额和手续费"
             return
         }
+        val token = if (tokenContract == null) {
+            null
+        } else {
+            currentTokens().find { it.contract.equals(tokenContract, true) } ?: run {
+                error = "这个网络没有这个代币"
+                return
+            }
+        }
         work {
+            if (token != null) {
+                val raw = parseMinor(amountRaw, token.decimals, token.symbol)
+                val held = withContext(Dispatchers.IO) { ChainApi(endpoint).tokenBalance(token.contract, address!!) }
+                if (held < raw) throw WalletException("代币余额不足")
+                val fee = tier.maxFee.multiply(BigInteger.valueOf(ERC20_TRANSFER_GAS))
+                if (ethBalance < fee) throw WalletException("${nativeCoinSymbol()} 不足以支付手续费")
+            }
             val payload = withContext(Dispatchers.Default) {
-                when (network!!.chain) {
-                    Chain.BITCOIN -> buildBitcoin(toRaw, amountRaw, tier)
-                    Chain.EVM -> buildEthereum(toRaw, amountRaw, tier)
+                when {
+                    network?.chain == Chain.BITCOIN -> buildBitcoin(toRaw, amountRaw, tier)
+                    isEvmAccount() -> buildEthereum(toRaw, amountRaw, tier, token)
+                    else -> throw WalletException("请先选择账户")
                 }
             }
             pendingUnsigned = payload
@@ -463,34 +601,240 @@ class WalletViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun acceptSigned(raw: String) {
-        work {
-            val tx = withContext(Dispatchers.Default) { checkSigned(raw.trim()) }
-            val txid = withContext(Dispatchers.IO) {
-                val api = ChainApi(endpoint)
-                when (network!!.chain) {
-                    Chain.BITCOIN -> api.broadcastBitcoin(tx.raw)
-                    Chain.EVM -> api.broadcastEthereum(tx.raw)
+        if (broadcasting) return
+        broadcasting = true
+        error = null
+        viewModelScope.launch {
+            try {
+                val tx = withContext(Dispatchers.Default) { checkSigned(raw.trim()) }
+                val chain = network?.chain ?: if (customChainId != null) Chain.EVM else throw WalletException("请先选择账户")
+                val txid = withContext(Dispatchers.IO) {
+                    val api = ChainApi(endpoint)
+                    when (chain) {
+                        Chain.BITCOIN -> api.broadcastBitcoin(tx.raw)
+                        Chain.EVM -> api.broadcastEthereum(tx.raw)
+                    }
                 }
+                pendingUnsigned = null
+                resultTitle = "已广播"
+                resultBody = txid.ifBlank { tx.txid }
+                resultLink = network?.let { explorerTx(it, resultBody) }
+                screen = Screen.Result
+            } catch (e: WalletException) {
+                error = e.message
+            } catch (e: Exception) {
+                error = e.message ?: "出错了"
+            } finally {
+                broadcasting = false
             }
-            pendingUnsigned = null
-            resultTitle = "已广播"
-            resultBody = txid.ifBlank { tx.txid }
-            resultLink = explorerTx(network!!, resultBody)
-            screen = Screen.Result
         }
     }
 
-    fun endpointOf(network: NetworkId): String = endpointFor(network)
+    fun endpointOf(wire: String): String = endpointForWire(wire)
 
-    fun updateEndpoint(network: NetworkId, raw: String) {
-        val value = raw.trim().trimEnd('/')
-        if (!value.startsWith("https://") && !value.startsWith("http://")) {
-            error = "节点地址需要以 http:// 或 https:// 开头"
+    fun checkUpdate() {
+        if (updateBusy) return
+        if (role != Role.ONLINE) {
+            updateNotice = UpdateNotice.Failed("离线手机不访问网络。请在在线那台检查更新。")
             return
         }
-        endpoints[network.wire] = value
-        if (this.network == network) endpoint = value
-        prefs.edit().putString("endpoints", JSONObject(endpoints as Map<*, *>).toString()).commit()
+        viewModelScope.launch {
+            updateBusy = true
+            updateNotice = null
+            try {
+                val release = withContext(Dispatchers.IO) { AppUpdate.latest() }
+                updateNotice = when {
+                    release == null || !AppUpdate.isNewer(release.version, BuildConfig.VERSION_NAME) -> UpdateNotice.Latest
+                    release.apkUrl.isNullOrBlank() -> UpdateNotice.Failed("发现新版本 ${release.version}，但发布里没有安装包")
+                    else -> UpdateNotice.Available(release)
+                }
+            } catch (e: WalletException) {
+                updateNotice = UpdateNotice.Failed(e.message ?: "检查更新失败")
+            } catch (e: Exception) {
+                updateNotice = UpdateNotice.Failed(e.message ?: "无法连接 GitHub")
+            } finally {
+                updateBusy = false
+            }
+        }
+    }
+
+    fun installUpdate() {
+        val available = updateNotice as? UpdateNotice.Available ?: return
+        val url = available.release.apkUrl ?: return
+        if (updateBusy) return
+        val app = getApplication<Application>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !app.packageManager.canRequestPackageInstalls()) {
+            updateNotice = UpdateNotice.Failed("请先允许安装未知应用，然后再点更新")
+            val intent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${app.packageName}"))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            app.startActivity(intent)
+            return
+        }
+        viewModelScope.launch {
+            updateBusy = true
+            try {
+                val file = java.io.File(app.cacheDir, "updates/offline-wallet-update.apk")
+                withContext(Dispatchers.IO) { AppUpdate.download(url, file) }
+                AppUpdate.install(app, file)
+                updateNotice = null
+            } catch (e: WalletException) {
+                updateNotice = UpdateNotice.Failed(e.message ?: "下载失败")
+            } catch (e: Exception) {
+                updateNotice = UpdateNotice.Failed(e.message ?: "下载失败")
+            } finally {
+                updateBusy = false
+            }
+        }
+    }
+
+    fun dismissUpdate() {
+        if (!updateBusy) updateNotice = null
+    }
+
+    fun isCurrent(account: StoredAccount): Boolean = account.address == selectedAddress && account.network == selectedWire
+
+    fun chainTitle(wire: String?): String {
+        if (wire.isNullOrBlank()) return "未标记网络"
+        return chainChoices.find { it.wire == wire }?.title
+            ?: runCatching { NetworkId.fromWire(wire).title }.getOrDefault("未标记网络")
+    }
+
+    fun accountCaption(account: StoredAccount): String {
+        val net = chainTitle(account.network)
+        val type = BtcAddressType.fromWire(account.kind)?.title
+        return if (type == null) net else "$net · $type"
+    }
+
+    fun updateEndpoint(wire: String, raw: String) {
+        try {
+            val value = normalizeEndpoint(raw)
+            endpoints[wire] = value
+            if (selectedWire == wire) endpoint = value
+            persistEndpoints()
+            error = null
+        } catch (e: WalletException) {
+            error = e.message
+        }
+    }
+
+    private fun rememberEvmChain(name: String, chainId: Long): String {
+        if (chainId == 11155111L) throw WalletException("以太坊测试网已去掉")
+        val wire = "evm-$chainId"
+        if (customEvm.any { it.chainId == chainId }) throw WalletException("这个 Chain ID 已经添加过")
+        customEvm += EvmChainConfig(wire, name, chainId, builtin = false)
+        return wire
+    }
+
+    fun addOfflineEvmChain(title: String, chainIdText: String) {
+        try {
+            val name = title.trim()
+            val chainId = chainIdText.trim().toLongOrNull()
+            if (name.isEmpty()) throw WalletException("请填写网络名称")
+            if (chainId == null || chainId <= 0L) throw WalletException("Chain ID 必须是正整数")
+            if (chainId == 1L) throw WalletException("以太坊主网已经在列表里，不能重复添加")
+            rememberEvmChain(name, chainId)
+            rebuildChains()
+            persistChains()
+            networkFormEpoch++
+            error = null
+        } catch (e: WalletException) {
+            error = e.message
+        }
+    }
+
+    fun addEvmChain(title: String, chainIdText: String, endpoint: String) {
+        if (busy) return
+        val name = title.trim()
+        val chainId = chainIdText.trim().toLongOrNull()
+        viewModelScope.launch {
+            busy = true
+            error = null
+            try {
+                if (name.isEmpty()) throw WalletException("请填写网络名称")
+                if (chainId == null || chainId <= 0L) throw WalletException("Chain ID 必须是正整数")
+                if (chainId == 1L) throw WalletException("以太坊主网已经在列表里，不能重复添加")
+                val node = normalizeEndpoint(endpoint)
+                val seen = withContext(Dispatchers.IO) { ChainApi(node).evmChainId() }
+                if (seen != chainId) throw WalletException("节点 chainId 是 $seen，和填写的不一致")
+                val wire = rememberEvmChain(name, chainId)
+                endpoints[wire] = node
+                rebuildChains()
+                persistChains()
+                networkFormEpoch++
+            } catch (e: WalletException) {
+                error = e.message
+            } catch (e: Exception) {
+                error = e.message ?: "添加网络失败"
+            } finally {
+                busy = false
+            }
+        }
+    }
+
+    fun renameEvmChain(wire: String, title: String): Boolean {
+        return try {
+            if (wire == NetworkId.ETHEREUM_MAINNET.wire) throw WalletException("以太坊主网不能修改")
+            val name = title.trim()
+            if (name.isEmpty()) throw WalletException("请填写网络名称")
+            val index = customEvm.indexOfFirst { it.wire == wire }
+            if (index < 0) throw WalletException("这个网络不能修改")
+            customEvm[index] = customEvm[index].copy(title = name)
+            rebuildChains()
+            persistChains()
+            error = null
+            true
+        } catch (e: WalletException) {
+            error = e.message
+            false
+        }
+    }
+
+    fun deleteEvmChain(wire: String) {
+        if (wire == NetworkId.ETHEREUM_MAINNET.wire) {
+            error = "以太坊主网不能删除"
+            return
+        }
+        if (accounts.any { it.network == wire }) {
+            error = "这个网络上还有账户，先移除账户"
+            return
+        }
+        val builtin = wire == NetworkId.ETHEREUM_SEPOLIA.wire
+        if (builtin) hiddenEvm += wire else customEvm.removeAll { it.wire == wire }
+        savedTokens = savedTokens.filterNot { it.network == wire }
+        endpoints.remove(wire)
+        rebuildChains()
+        persistChains()
+        error = null
+    }
+
+    fun addToken(wire: String, contract: String) {
+        if (busy) return
+        viewModelScope.launch {
+            busy = true
+            error = null
+            try {
+                val chain = evmChains.find { it.wire == wire } ?: throw WalletException("请选择 EVM 网络")
+                val node = endpointForWire(chain.wire).ifBlank { throw WalletException("请先保存这个网络的节点") }
+                val meta = withContext(Dispatchers.IO) { ChainApi(node).readErc20(contract) }
+                if (savedTokens.any { it.network == wire && it.contract.equals(meta.contract, true) }) {
+                    throw WalletException("这个代币已经添加过")
+                }
+                savedTokens = savedTokens + SavedToken(wire, meta.contract, meta.name, meta.symbol, meta.decimals)
+                persistChains()
+                tokenFormEpoch++
+            } catch (e: WalletException) {
+                error = e.message
+            } catch (e: Exception) {
+                error = e.message ?: "读取代币失败"
+            } finally {
+                busy = false
+            }
+        }
+    }
+
+    fun removeToken(network: String, contract: String) {
+        savedTokens = savedTokens.filterNot { it.network == network && it.contract.equals(contract, true) }
+        persistChains()
         error = null
     }
 
@@ -508,10 +852,19 @@ class WalletViewModel(app: Application) : AndroidViewModel(app) {
         info = null
         error = null
         hasAppPassword = false
+        customEvm.clear()
+        hiddenEvm.clear()
+        savedTokens = emptyList()
+        selectedWire = null
+        customChainId = null
+        endpoints.clear()
+        seedPresets()
+        rebuildChains()
         screen = Screen.RolePick
     }
 
     fun back() {
+        if (broadcasting) return
         error = null
         screen = when (val current = screen) {
             is Screen.Scan -> scanReturn
@@ -520,6 +873,7 @@ class WalletViewModel(app: Application) : AndroidViewModel(app) {
             Screen.ImportAddress, Screen.Send, Screen.Result -> Screen.OnlineHome
             Screen.Review -> Screen.OfflineHome
             Screen.ShowQr, Screen.Settings -> home()
+            Screen.Nodes, Screen.Tokens, Screen.EvmNetworks -> Screen.Settings
             else -> current
         }
     }
@@ -548,28 +902,45 @@ class WalletViewModel(app: Application) : AndroidViewModel(app) {
         }
         val psbt = buildPsbt(plan, toScript, toAddress, ownScript, own)
         reviewBitcoin(psbt, own, net)
-        return Envelope(1, PayloadKind.UNSIGNED, Chain.BITCOIN, net, encodePsbt(psbt).toBase64()).encode()
+        return Envelope(1, PayloadKind.UNSIGNED, Chain.BITCOIN, net.asChain(), encodePsbt(psbt).toBase64()).encode()
     }
 
-    private fun buildEthereum(toRaw: String, amountRaw: String, tier: FeeChoice): String {
-        val net = network!!
-        val to = normalizeEthAddress(toRaw)
-        val value = parseMinor(amountRaw, 18, "ETH")
-        val cost = value.add(tier.maxFee.multiply(BigInteger.valueOf(21_000)))
-        if (ethBalance < cost) throw WalletException("余额不足以支付金额和最高手续费")
-        val unsigned = encodeUnsignedEth(
-            EthUnsigned(
-                chainId = net.ethChainId(),
-                nonce = ethNonce,
-                maxPriorityFeePerGas = tier.tip,
-                maxFeePerGas = tier.maxFee,
-                gasLimit = 21_000,
-                to = to.removePrefix("0x").hexToBytes(),
-                value = value,
-            ),
-        )
-        reviewEthereum(unsigned, net.ethChainId())
-        return Envelope(1, PayloadKind.UNSIGNED, Chain.EVM, net, unsigned.toBase64()).encode()
+    private fun buildEthereum(toRaw: String, amountRaw: String, tier: FeeChoice, token: SavedToken?): String {
+        val chainId = if (network?.chain == Chain.EVM) network!!.ethChainId() else customChainId ?: throw WalletException("不是 EVM 网络")
+        val ref = ChainRef.fromWire(selectedWire ?: throw WalletException("请先选择账户"))
+        val recipient = normalizeEthAddress(toRaw)
+        val unsigned = if (token == null) {
+            val value = parseMinor(amountRaw, 18, nativeUnit(chainId))
+            val cost = value.add(tier.maxFee.multiply(BigInteger.valueOf(NATIVE_TRANSFER_GAS)))
+            if (ethBalance < cost) throw WalletException("余额不足以支付金额和最高手续费")
+            encodeUnsignedEth(
+                EthUnsigned(
+                    chainId = chainId,
+                    nonce = ethNonce,
+                    maxPriorityFeePerGas = tier.tip,
+                    maxFeePerGas = tier.maxFee,
+                    gasLimit = NATIVE_TRANSFER_GAS,
+                    to = recipient.removePrefix("0x").hexToBytes(),
+                    value = value,
+                ),
+            )
+        } else {
+            val raw = parseMinor(amountRaw, token.decimals, token.symbol)
+            encodeUnsignedEth(
+                EthUnsigned(
+                    chainId = chainId,
+                    nonce = ethNonce,
+                    maxPriorityFeePerGas = tier.tip,
+                    maxFeePerGas = tier.maxFee,
+                    gasLimit = ERC20_TRANSFER_GAS,
+                    to = token.contract.removePrefix("0x").hexToBytes(),
+                    value = BigInteger.ZERO,
+                    data = erc20TransferData(recipient.removePrefix("0x").hexToBytes(), raw),
+                ),
+            )
+        }
+        reviewEthereum(unsigned, chainId)
+        return Envelope(1, PayloadKind.UNSIGNED, Chain.EVM, ref, unsigned.toBase64()).encode()
     }
 
     private fun checkSigned(raw: String): SignedTx {
@@ -603,7 +974,7 @@ class WalletViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun bitcoinLines(env: Envelope): List<Pair<String, String>> {
-        val review = reviewBitcoin(decodePsbt(env.body.base64ToBytes()), address!!, env.network)
+        val review = reviewBitcoin(decodePsbt(env.body.base64ToBytes()), address!!, env.network.asNetworkId())
         needsFeeWarning = review.feeRate.toDouble() > 200.0
         val lines = mutableListOf(
             "网络" to env.network.title,
@@ -627,19 +998,48 @@ class WalletViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun ethereumLines(env: Envelope): List<Pair<String, String>> {
         val bytes = env.body.base64ToBytes()
-        val review = reviewEthereum(bytes, env.network.ethChainId())
-        needsFeeWarning = review.value.signum() > 0 && review.maxFee > review.value
+        val review = reviewEthereum(bytes, env.network.chainId)
+        val unit = nativeUnit(review.chainId)
+        val networkTitle = chainTitle(env.network.wire).let { if (it == "未标记网络") env.network.title else it }
+        val tokenRecipient = review.tokenRecipient
+        if (tokenRecipient == null) {
+            needsFeeWarning = review.value.signum() > 0 && review.maxFee > review.value
+            return listOf(
+                "网络" to "$networkTitle · ${review.chainId}",
+                "类型" to "原生币",
+                "签名者" to address!!,
+                "收款地址" to review.to,
+                "金额" to "${formatEth(review.value)} $unit",
+                "nonce" to review.nonce.toString(),
+                "gasLimit" to review.gasLimit.toString(),
+                "maxFeePerGas" to "${formatGwei(review.maxFeePerGas)} Gwei",
+                "priority fee" to "${formatGwei(review.maxPriorityFeePerGas)} Gwei",
+                "最高手续费" to "${formatEth(review.maxFee)} $unit",
+                "data" to "空",
+            )
+        }
+        needsFeeWarning = false
+        val saved = savedTokens.find { it.network == env.network.wire && it.contract.equals(review.to, true) }
+        val amount = review.tokenAmount ?: BigInteger.ZERO
+        val shown = if (saved == null) {
+            "$amount 最小单位"
+        } else {
+            "${formatBalance(amount, saved.decimals)} ${saved.symbol} · $amount 最小单位"
+        }
         return listOf(
-            "网络" to "${env.network.title} · ${review.chainId}",
+            "网络" to "$networkTitle · ${review.chainId}",
+            "类型" to "ERC-20 transfer",
             "签名者" to address!!,
-            "收款地址" to review.to,
-            "金额" to "${formatEth(review.value)} ETH",
+            "代币合约" to review.to,
+            "收款地址" to tokenRecipient,
+            "数量" to shown,
+            "附带原生币" to "0",
             "nonce" to review.nonce.toString(),
             "gasLimit" to review.gasLimit.toString(),
             "maxFeePerGas" to "${formatGwei(review.maxFeePerGas)} Gwei",
             "priority fee" to "${formatGwei(review.maxPriorityFeePerGas)} Gwei",
-            "最高手续费" to "${formatEth(review.maxFee)} ETH",
-            "data" to "空",
+            "最高手续费" to "${formatEth(review.maxFee)} $unit",
+            "data" to "transfer(address,uint256)",
         )
     }
 
@@ -660,12 +1060,14 @@ class WalletViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun currentAccount(): StoredAccount? =
-        accounts.find { it.address == selectedAddress && it.network == network?.wire }
+        accounts.find { it.address == selectedAddress && it.network == selectedWire }
 
     private fun applyAccount(account: StoredAccount, resetBalance: Boolean = true) {
         selectedAddress = account.address
+        selectedWire = account.network
         network = account.networkId()
-        endpoint = endpointFor(network)
+        customChainId = if (network == null) customEvm.find { it.wire == account.network }?.chainId else null
+        endpoint = endpointForWire(account.network)
         if (resetBalance) clearChainState()
     }
 
@@ -680,9 +1082,123 @@ class WalletViewModel(app: Application) : AndroidViewModel(app) {
         ethNonce = 0L
     }
 
-    private fun endpointFor(net: NetworkId?): String {
-        if (net == null) return ""
-        return endpoints[net.wire]?.takeIf { it.startsWith("https://") || it.startsWith("http://") } ?: defaultEndpoint(net)
+    private fun choice(wire: String): ChainChoice {
+        if (wire == NetworkId.BITCOIN_TESTNET3.wire || wire == NetworkId.ETHEREUM_SEPOLIA.wire) {
+            throw WalletException("测试网络已去掉")
+        }
+        return chainChoices.find { it.wire == wire } ?: throw WalletException("请先选择网络")
+    }
+
+    private fun endpointForWire(wire: String?): String {
+        if (wire.isNullOrBlank()) return ""
+        val saved = endpoints[wire]?.takeIf { it.startsWith("https://") || it.startsWith("http://") }
+        if (saved != null) return saved
+        presetEndpoint(wire)?.let { return it }
+        val builtin = runCatching { NetworkId.fromWire(wire) }.getOrNull() ?: return ""
+        return defaultEndpoint(builtin)
+    }
+
+    private fun rebuildChains() {
+        val evm = mutableListOf<EvmChainConfig>()
+        evm += EvmChainConfig(NetworkId.ETHEREUM_MAINNET.wire, NetworkId.ETHEREUM_MAINNET.title, 1L, builtin = true)
+        evm += customEvm
+        evmChains = evm
+        val choices = mutableListOf<ChainChoice>()
+        choices += ChainChoice(NetworkId.BITCOIN_MAINNET.wire, NetworkId.BITCOIN_MAINNET.title, Chain.BITCOIN, false, "主网")
+        evm.forEach { chain ->
+            val test = chain.chainId != 1L && chain.builtin
+            choices += ChainChoice(chain.wire, chain.title, Chain.EVM, test, "链 ID ${chain.chainId}")
+        }
+        chainChoices = choices
+    }
+
+    private fun seedPresets() {
+        if (prefs.getBoolean("presets_v1", false)) return
+        for (preset in presetChains) {
+            val wire = "evm-${preset.chainId}"
+            if (customEvm.none { it.chainId == preset.chainId }) {
+                customEvm += EvmChainConfig(wire, preset.title, preset.chainId, builtin = false)
+            }
+            if (endpoints[wire].isNullOrBlank()) endpoints[wire] = preset.endpoint
+        }
+        val existing = savedTokens.toMutableList()
+        for (token in presetTokens()) {
+            if (existing.none { it.network == token.network && it.contract.equals(token.contract, true) }) {
+                existing += token
+            }
+        }
+        savedTokens = existing
+        persistChains()
+        prefs.edit().putBoolean("presets_v1", true).commit()
+    }
+
+    private fun migrateBscEndpoint() {
+        if (endpoints["evm-56"] == "http://192.168.3.3:8547") {
+            endpoints["evm-56"] = "https://rpc-bsc.blockmachine.io"
+            persistEndpoints()
+        }
+    }
+
+    private fun loadChains() {
+        customEvm.clear()
+        hiddenEvm.clear()
+        prefs.getString("hiddenEvm", null)?.let { raw ->
+            val array = JSONArray(raw)
+            for (index in 0 until array.length()) hiddenEvm += array.getString(index)
+        }
+        prefs.getString("customEvm", null)?.let { raw ->
+            val array = JSONArray(raw)
+            for (index in 0 until array.length()) {
+                val obj = array.getJSONObject(index)
+                val chainId = obj.getLong("chainId")
+                customEvm += EvmChainConfig("evm-$chainId", obj.getString("title"), chainId, builtin = false)
+            }
+        }
+    }
+
+    private fun loadTokens() {
+        val raw = prefs.getString("tokens", null) ?: return
+        val array = JSONArray(raw)
+        savedTokens = List(array.length()) { index ->
+            val obj = array.getJSONObject(index)
+            SavedToken(
+                network = obj.getString("network"),
+                contract = obj.getString("contract"),
+                name = obj.getString("name"),
+                symbol = obj.getString("symbol"),
+                decimals = obj.getInt("decimals"),
+            )
+        }
+    }
+
+    private fun persistChains() {
+        val chains = JSONArray()
+        customEvm.forEach { chain ->
+            chains.put(JSONObject().put("title", chain.title).put("chainId", chain.chainId))
+        }
+        val hidden = JSONArray()
+        hiddenEvm.forEach { hidden.put(it) }
+        val tokenArray = JSONArray()
+        savedTokens.forEach { token ->
+            tokenArray.put(
+                JSONObject()
+                    .put("network", token.network)
+                    .put("contract", token.contract)
+                    .put("name", token.name)
+                    .put("symbol", token.symbol)
+                    .put("decimals", token.decimals),
+            )
+        }
+        prefs.edit()
+            .putString("customEvm", chains.toString())
+            .putString("hiddenEvm", hidden.toString())
+            .putString("tokens", tokenArray.toString())
+            .putString("endpoints", JSONObject(endpoints as Map<*, *>).toString())
+            .commit()
+    }
+
+    private fun persistEndpoints() {
+        prefs.edit().putString("endpoints", JSONObject(endpoints as Map<*, *>).toString()).commit()
     }
 
     private fun loadEndpoints() {
@@ -713,7 +1229,7 @@ class WalletViewModel(app: Application) : AndroidViewModel(app) {
     private fun persist() {
         prefs.edit()
             .putString("role", role?.name)
-            .putString("network", network?.wire)
+            .putString("network", selectedWire)
             .putString("endpoint", endpoint)
             .putString("accounts", encodeAccounts(accounts))
             .putString("selected", currentAccount()?.let(::selectionToken) ?: selectedAddress)
@@ -855,6 +1371,14 @@ private fun withDefaultNotes(list: List<StoredAccount>): List<StoredAccount> {
 
 private fun selectionToken(account: StoredAccount): String = "${account.network.orEmpty()}|${account.address}"
 
+private fun normalizeEndpoint(raw: String): String {
+    val value = raw.trim().trimEnd('/')
+    if (!value.startsWith("https://") && !value.startsWith("http://")) {
+        throw WalletException("节点地址需要以 http:// 或 https:// 开头")
+    }
+    return value
+}
+
 private fun spaceName(context: Context): String {
     if (android.os.Process.myUid() / 100000 != 0) return "分身"
     val dir = context.filesDir.absolutePath.replace('\\', '/')
@@ -878,6 +1402,23 @@ private fun minorSats(text: String): Long {
     if (value.bitLength() > 62) throw WalletException("金额超出范围")
     return value.toLong()
 }
+
+private data class PresetChain(val title: String, val chainId: Long, val endpoint: String)
+
+private val presetChains = listOf(
+    PresetChain("BNB Smart Chain", 56, "https://rpc-bsc.blockmachine.io"),
+    PresetChain("Arbitrum One", 42161, "https://rpc-arbitrum.blockmachine.io"),
+    PresetChain("Polygon Mainnet", 137, "https://polygon.gateway.tenderly.co"),
+)
+
+private fun presetEndpoint(wire: String): String? = presetChains.find { wire == "evm-${it.chainId}" }?.endpoint
+
+private fun presetTokens(): List<SavedToken> = listOf(
+    SavedToken(NetworkId.ETHEREUM_MAINNET.wire, normalizeEthAddress("0xdac17f958d2ee523a2206206994597c13d831ec7"), "Tether USD", "USDT", 6),
+    SavedToken("evm-56", normalizeEthAddress("0x55d398326f99059ff775485246999027b3197955"), "Tether USD", "USDT", 18),
+    SavedToken("evm-42161", normalizeEthAddress("0xaf88d065e77c8cc2239327c5edb3a432268e5831"), "USD Coin", "USDC", 6),
+    SavedToken("evm-137", normalizeEthAddress("0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"), "USD Coin", "USDC", 6),
+)
 
 fun defaultEndpoint(network: NetworkId): String = when (network) {
     NetworkId.BITCOIN_MAINNET -> "https://blockstream.info/api"

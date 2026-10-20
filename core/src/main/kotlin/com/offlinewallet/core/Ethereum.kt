@@ -22,7 +22,41 @@ data class EthReview(
     val to: String,
     val value: BigInteger,
     val maxFee: BigInteger,
+    val tokenRecipient: String? = null,
+    val tokenAmount: BigInteger? = null,
 )
+
+const val NATIVE_TRANSFER_GAS = 21_000L
+const val ERC20_TRANSFER_GAS = 100_000L
+
+data class EvmGasTier(val label: String, val maxFee: BigInteger, val tip: BigInteger)
+
+fun evmGasTiers(quoted: BigInteger, base: BigInteger, highTip: BigInteger = BigInteger.ZERO): List<EvmGasTier> {
+    val quotedFee = quoted.coerceAtLeast(BigInteger.ZERO)
+    val baseFee = base.coerceAtLeast(BigInteger.ZERO)
+    val standard = when {
+        quotedFee.signum() > 0 && quotedFee >= baseFee -> quotedFee
+        baseFee.signum() > 0 -> baseFee
+        else -> BigInteger.ONE
+    }
+    val standardTip = if (baseFee.signum() == 0 || standard <= baseFee) standard else standard.subtract(baseFee)
+    val economyTarget = standard.multiply(BigInteger.valueOf(4)).divide(BigInteger.valueOf(5))
+    val economy = when {
+        economyTarget.signum() == 0 -> BigInteger.ONE.min(standard)
+        baseFee.signum() > 0 && economyTarget < baseFee -> baseFee.min(standard)
+        else -> economyTarget
+    }.coerceAtMost(standard).coerceAtLeast(BigInteger.ONE)
+    val economyTip = if (baseFee.signum() == 0 || economy <= baseFee) economy.min(standardTip) else economy.subtract(baseFee)
+    val fastTarget = standard.multiply(BigInteger.valueOf(5)).divide(BigInteger.valueOf(4)).max(standard.add(BigInteger.ONE))
+    val raised = baseFee.add(highTip.coerceAtLeast(BigInteger.ZERO))
+    val fast = if (raised > fastTarget) raised else fastTarget
+    val fastTip = if (baseFee.signum() == 0 || fast <= baseFee) fast else fast.subtract(baseFee)
+    return listOf(
+        EvmGasTier("经济", economy, economyTip.min(economy)),
+        EvmGasTier("标准", standard, standardTip.min(standard)),
+        EvmGasTier("优先", fast, fastTip.min(fast)),
+    )
+}
 
 fun NetworkId.ethChainId(): Long = when (this) {
     NetworkId.ETHEREUM_MAINNET -> 1L
@@ -56,10 +90,21 @@ fun normalizeEthAddress(input: String): String {
     return checksummed
 }
 
+fun erc20TransferData(recipient: ByteArray, amount: BigInteger): ByteArray {
+    if (recipient.size != 20) throw WalletException("收款地址无效")
+    if (amount.signum() < 0) throw WalletException("金额无效")
+    return "a9059cbb".hexToBytes() + ByteArray(12) + recipient + amount.toUnsigned32()
+}
+
 fun encodeUnsignedEth(tx: EthUnsigned): ByteArray {
     if (tx.to.size != 20) throw WalletException("收款地址无效")
-    if (tx.data.isNotEmpty()) throw WalletException("一期拒绝带 data 的合约调用")
-    if (tx.gasLimit != 21_000L) throw WalletException("原生转账的 gasLimit 必须是 21000")
+    if (tx.data.isEmpty()) {
+        if (tx.gasLimit != NATIVE_TRANSFER_GAS) throw WalletException("原生转账的 gasLimit 必须是 21000")
+    } else {
+        parseErc20Transfer(tx.data)
+        if (tx.value.signum() != 0) throw WalletException("代币转账不能附带原生币")
+        if (tx.gasLimit != ERC20_TRANSFER_GAS) throw WalletException("ERC-20 转账的 gasLimit 必须是 100000")
+    }
     if (tx.maxFeePerGas < tx.maxPriorityFeePerGas) throw WalletException("maxFee 不能低于 priority fee")
     if (tx.maxFeePerGas.signum() <= 0) throw WalletException("手续费必须大于 0")
     return byteArrayOf(0x02) + Rlp.encode(unsignedList(tx))
@@ -80,12 +125,19 @@ fun reviewEthereum(unsigned: ByteArray, expectedChainId: Long): EthReview {
     val value = Rlp.asUInt(list.items[6])
     val data = (list.items[7] as? Rlp.Item.Bytes)?.data ?: throw WalletException("data 字段无效")
     val access = list.items[8] as? Rlp.Item.List ?: throw WalletException("accessList 无效")
-    if (to.size != 20) throw WalletException("一期拒绝创建合约")
-    if (data.isNotEmpty()) throw WalletException("data 不是空的，已拒绝。一期只做原生 ETH 转账")
-    if (access.items.isNotEmpty()) throw WalletException("一期不接受 accessList")
-    if (gasLimit != 21_000L) throw WalletException("gasLimit 不是 21000，已拒绝")
+    if (to.size != 20) throw WalletException("拒绝创建合约")
+    if (access.items.isNotEmpty()) throw WalletException("不接受 accessList")
     if (maxFee < priority || maxFee.signum() <= 0) throw WalletException("手续费无效")
     if (value.signum() < 0) throw WalletException("金额无效")
+    val transfer = if (data.isEmpty()) {
+        if (gasLimit != NATIVE_TRANSFER_GAS) throw WalletException("gasLimit 不是 21000，已拒绝")
+        null
+    } else {
+        val parsed = parseErc20Transfer(data)
+        if (value.signum() != 0) throw WalletException("代币转账不能附带原生币")
+        if (gasLimit != ERC20_TRANSFER_GAS) throw WalletException("ERC-20 的 gasLimit 不是 100000，已拒绝")
+        parsed
+    }
     return EthReview(
         chainId = chainId,
         nonce = nonce,
@@ -95,6 +147,8 @@ fun reviewEthereum(unsigned: ByteArray, expectedChainId: Long): EthReview {
         to = toEip55(to),
         value = value,
         maxFee = maxFee.multiply(BigInteger.valueOf(gasLimit)),
+        tokenRecipient = transfer?.first,
+        tokenAmount = transfer?.second,
     )
 }
 
@@ -150,6 +204,26 @@ private fun unsignedList(tx: EthUnsigned): Rlp.Item.List = Rlp.Item.List(
         Rlp.Item.List(emptyList()),
     ),
 )
+
+private fun parseErc20Transfer(data: ByteArray): Pair<String, BigInteger> {
+    if (data.size != 68 || !data.copyOfRange(0, 4).contentEquals("a9059cbb".hexToBytes())) {
+        throw WalletException("只接受原生币转账或 ERC-20 transfer，其他合约调用已拒绝")
+    }
+    if (data.copyOfRange(4, 16).any { it != 0.toByte() }) throw WalletException("ERC-20 收款地址编码无效")
+    val recipient = toEip55(data.copyOfRange(16, 36))
+    val amount = BigInteger(1, data.copyOfRange(36, 68))
+    if (amount.signum() <= 0) throw WalletException("代币数量必须大于 0")
+    return recipient to amount
+}
+
+private fun BigInteger.toUnsigned32(): ByteArray {
+    val raw = toByteArray()
+    val body = if (raw.size == 33 && raw[0] == 0.toByte()) raw.copyOfRange(1, 33) else raw
+    if (body.size > 32) throw WalletException("金额超出范围")
+    val out = ByteArray(32)
+    body.copyInto(out, 32 - body.size)
+    return out
+}
 
 private fun ethChainIdOf(unsigned: ByteArray): Long {
     val list = Rlp.decode(unsigned.copyOfRange(1, unsigned.size)) as Rlp.Item.List

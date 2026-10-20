@@ -9,12 +9,12 @@
 
 第一期支持：
 
-- Bitcoin 主网和 Testnet3。导入私钥时选择网络，并可以同时勾选 Native SegWit（`bc1q` / `tb1q`）、Nested SegWit（`3…` / `2…`）、Legacy（`1…` / `m…` 或 `n…`）、Taproot（`bc1p` / `tb1p`）。每种地址单独成为一个账户
-- Ethereum 主网和 Sepolia，只转原生 ETH，EIP-1559，`gasLimit` 固定 21000。每个账户自己带网络，可以和比特币账户放在同一台手机上
+- Bitcoin 主网。导入私钥时选择网络，并可以同时勾选 Native SegWit（`bc1q`）、Nested SegWit（`3…`）、Legacy（`1…`）、Taproot（`bc1p`）。每种地址单独成为一个账户
+- Ethereum 主网，以及设置里添加的 EVM 网络。原生币转账是 EIP-1559，`gasLimit` 固定 21000，`data` 为空。当前网络已添加的 ERC-20 走 `transfer(address,uint256)`，`value` 为 0，`gasLimit` 固定 100000。其他合约调用仍会拒绝。离线手机添加自定义网络时只记录名称和 Chain ID。每个账户自己带网络，可以和比特币账户放在同一台手机上
 
-交易确认页从交易原文解析。比特币找零如果不是本机地址，或者以太坊交易带有 `data`，离线端会拒绝签名。
+交易确认页从交易原文解析。比特币找零如果不是本机地址，离线端会拒绝签名。EVM 只签原生币转账，或标准 ERC-20 `transfer`。`approve`、`transferFrom` 和其他合约调用都会拒绝。
 
-这个软件没有经过独立安全审计。先在 Testnet3 和 Sepolia 上走通，再考虑主网。作者不对资产损失负责。
+这个软件没有经过独立安全审计。作者不对资产损失负责。
 
 ## 两台手机怎么用
 
@@ -90,7 +90,7 @@ app/build/outputs/apk/release/app-release.apk
 二维码和粘贴文本使用同一段文字，前缀是 `owtx1:`，后面是一层 JSON：
 
 ```json
-{"v":1,"kind":"unsigned","chain":"bitcoin","network":"bitcoin-testnet3","body":"..."}
+{"v":1,"kind":"unsigned","chain":"bitcoin","network":"bitcoin-mainnet","body":"..."}
 ```
 
 | 字段 | 取值 |
@@ -98,7 +98,7 @@ app/build/outputs/apk/release/app-release.apk
 | `v` | 目前只有 `1` |
 | `kind` | `address`、`unsigned`、`signed` |
 | `chain` | `bitcoin` 或 `evm` |
-| `network` | `bitcoin-mainnet`、`bitcoin-testnet3`、`ethereum-mainnet`、`ethereum-sepolia` |
+| `network` | `bitcoin-mainnet`、`ethereum-mainnet`，或自定义网络 `evm-<chainId>` |
 | `body` | 地址原文，或交易的 Base64 |
 
 地址、未签名交易、已签名交易不能混扫。Bitcoin 的交易正文是 PSBT。EVM 的未签名正文是 `0x02` 开头的 EIP-1559 RLP，已签名正文带 `yParity`、`r`、`s`。
@@ -106,11 +106,14 @@ app/build/outputs/apk/release/app-release.apk
 默认节点：
 
 - Bitcoin 主网 `https://blockstream.info/api`
-- Bitcoin Testnet3 `https://blockstream.info/testnet/api`
 - Ethereum 主网 `https://ethereum.publicnode.com`
-- Sepolia `https://ethereum-sepolia-rpc.publicnode.com`
+- BNB Smart Chain（链 ID 56）`https://rpc-bsc.blockmachine.io`
+- Arbitrum One（链 ID 42161）`https://rpc-arbitrum.blockmachine.io`
+- Polygon Mainnet（链 ID 137）`https://polygon.gateway.tenderly.co`
 
-在线端设置里可以分别修改四个网络的节点，`http://` 和 `https://` 都可以。余额最多显示 8 位小数。
+这三条 EVM 网络在离线端和在线端都是预装的。在线端另外预装四枚稳定币：以太坊 USDT、BNB Chain USDT、Arbitrum USDC、Polygon USDC。删掉之后不会自动加回来。
+
+在线端设置里可以分别修改每个网络的节点，`http://` 和 `https://` 都可以。可以添加、删除 EVM 网络，以太坊主网不能删除。也可以按网络和合约地址添加 ERC-20，应用会读出名称、符号和小数位并保存。余额最多显示 8 位小数。
 
 ## 安全边界
 

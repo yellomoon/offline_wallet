@@ -27,11 +27,47 @@ enum class NetworkId(
 
 enum class PayloadKind { ADDRESS, UNSIGNED, SIGNED }
 
+data class ChainRef(
+    val wire: String,
+    val chain: Chain,
+    val title: String,
+    val unit: String,
+    val chainId: Long = 0,
+) {
+    fun asNetworkId(): NetworkId = NetworkId.fromWire(wire)
+
+    companion object {
+        fun fromWire(value: String): ChainRef {
+            NetworkId.entries.firstOrNull { it.wire == value }?.let { return it.asChain() }
+            if (value.startsWith("evm-")) {
+                val id = value.removePrefix("evm-").toLongOrNull()
+                if (id != null && id > 0L) return ChainRef(value, Chain.EVM, "EVM $id", nativeUnit(id), id)
+            }
+            throw WalletException("不认识的网络")
+        }
+    }
+}
+
+fun NetworkId.asChain(): ChainRef = ChainRef(
+    wire = wire,
+    chain = chain,
+    title = title,
+    unit = unit,
+    chainId = if (chain == Chain.EVM) ethChainId() else 0L,
+)
+
+fun nativeUnit(chainId: Long): String = when (chainId) {
+    56L, 97L -> "BNB"
+    137L -> "POL"
+    43114L -> "AVAX"
+    else -> "ETH"
+}
+
 data class Envelope(
     val version: Int,
     val kind: PayloadKind,
     val chain: Chain,
-    val network: NetworkId,
+    val network: ChainRef,
     val body: String,
 ) {
     fun encode(): String {
@@ -69,7 +105,7 @@ data class Envelope(
                 "evm" -> Chain.EVM
                 else -> throw WalletException("报文里的链不受支持")
             }
-            val network = NetworkId.fromWire(fields["network"] ?: throw WalletException("报文缺少网络"))
+            val network = ChainRef.fromWire(fields["network"] ?: throw WalletException("报文缺少网络"))
             if (network.chain != chain) throw WalletException("链和网络不匹配")
             val body = fields["body"] ?: throw WalletException("报文缺少正文")
             if (body.isEmpty()) throw WalletException("报文正文是空的")

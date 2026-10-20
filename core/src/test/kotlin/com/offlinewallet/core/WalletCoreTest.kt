@@ -185,6 +185,37 @@ class WalletCoreTest {
         )
         assertThrows(WalletException::class.java) { reviewEthereum(bad, 1) }
         assertThrows(WalletException::class.java) { normalizeEthAddress("0x7e5f4552091A69125d5DfCb7b8C2659029395Bdf") }
+        val tokenTo = "0000000000000000000000000000000000000002".hexToBytes()
+        val tokenTx = encodeUnsignedEth(
+            EthUnsigned(
+                chainId = 1,
+                nonce = 3,
+                maxPriorityFeePerGas = BigInteger.ONE,
+                maxFeePerGas = BigInteger.TEN,
+                gasLimit = ERC20_TRANSFER_GAS,
+                to = ByteArray(20) { 0x11 },
+                value = BigInteger.ZERO,
+                data = erc20TransferData(tokenTo, BigInteger("1000000")),
+            ),
+        )
+        val tokenReview = reviewEthereum(tokenTx, 1)
+        assertEquals("0x0000000000000000000000000000000000000002", tokenReview.tokenRecipient)
+        assertEquals(BigInteger("1000000"), tokenReview.tokenAmount)
+        assertEquals(BigInteger.ZERO, tokenReview.value)
+        val tokenSigned = signEthereum(tokenTx, priv)
+        assertEquals(from, ethereumSender(tokenSigned))
+        assertArrayEquals(tokenTx, unsignedFromSignedEth(tokenSigned))
+        val transfer = erc20TransferData(tokenTo, BigInteger("1000000"))
+        assertThrows(WalletException::class.java) {
+            encodeUnsignedEth(
+                EthUnsigned(1, 3, BigInteger.ONE, BigInteger.TEN, ERC20_TRANSFER_GAS, ByteArray(20) { 0x11 }, BigInteger.ONE, transfer),
+            )
+        }
+        assertThrows(WalletException::class.java) {
+            encodeUnsignedEth(
+                EthUnsigned(1, 3, BigInteger.ONE, BigInteger.TEN, NATIVE_TRANSFER_GAS, ByteArray(20) { 0x11 }, BigInteger.ZERO, transfer),
+            )
+        }
     }
 
     @Test
@@ -194,7 +225,7 @@ class WalletCoreTest {
         assertEquals("c0", Rlp.encode(Rlp.Item.List(emptyList())).toHex())
         assertEquals(10_000_000.toBigInteger(), parseMinor("0.1", 8, "BTC"))
         assertThrows(WalletException::class.java) { parseMinor("0.000000001", 8, "BTC") }
-        val envelope = Envelope(1, PayloadKind.UNSIGNED, Chain.BITCOIN, NetworkId.BITCOIN_TESTNET3, "abc+/=")
+        val envelope = Envelope(1, PayloadKind.UNSIGNED, Chain.BITCOIN, NetworkId.BITCOIN_TESTNET3.asChain(), "abc+/=")
         val decoded = Envelope.decode(envelope.encode())
         assertEquals(envelope, decoded)
         assertThrows(WalletException::class.java) { Envelope.decode("{\"v\":1}") }
@@ -204,5 +235,37 @@ class WalletCoreTest {
         assertThrows(WalletException::class.java) {
             SecretBox.decrypt(blob, "wrong-password".toCharArray(), iterations = 1_000)
         }
+    }
+
+    @Test
+    fun erc20DecodesAbiStringBytes32AndDecimals() {
+        val dynamic = ByteArray(96)
+        dynamic[31] = 32
+        dynamic[63] = 4
+        "USDC".toByteArray().copyInto(dynamic, 64)
+        assertEquals("USDC", Erc20.decodeString(dynamic))
+        val word = ByteArray(32)
+        "MKR".toByteArray().copyInto(word, 0)
+        assertEquals("MKR", Erc20.decodeString(word))
+        val decimals = ByteArray(32)
+        decimals[31] = 6
+        assertEquals(6.toBigInteger(), Erc20.decodeUint(decimals))
+    }
+
+    @Test
+    fun standardGasTierMatchesTheQuotedNetworkPrice() {
+        val gwei = BigInteger("1000000000")
+        val tiers = evmGasTiers(quoted = gwei.multiply(BigInteger.valueOf(16)), base = gwei.multiply(BigInteger.valueOf(15)), highTip = gwei.multiply(BigInteger.valueOf(2)))
+        assertEquals("标准", tiers[1].label)
+        assertEquals(gwei.multiply(BigInteger.valueOf(16)), tiers[1].maxFee)
+        assertEquals(gwei, tiers[1].tip)
+        assertTrue(tiers[0].maxFee < tiers[1].maxFee)
+        assertTrue(tiers[2].maxFee > tiers[1].maxFee)
+        assertTrue(tiers.all { it.maxFee >= it.tip && it.maxFee.signum() > 0 })
+        val cheap = evmGasTiers(quoted = BigInteger.valueOf(50_000_000), base = BigInteger.ZERO)
+        assertEquals(BigInteger.valueOf(50_000_000), cheap[1].maxFee)
+        assertEquals(BigInteger.valueOf(40_000_000), cheap[0].maxFee)
+        assertEquals(BigInteger.valueOf(62_500_000), cheap[2].maxFee)
+        assertTrue(cheap[1].maxFee < BigInteger("1000000000"))
     }
 }

@@ -1,7 +1,17 @@
 package com.offlinewallet.ui
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioTrack
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
@@ -11,21 +21,29 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
@@ -40,9 +58,12 @@ import com.google.zxing.MultiFormatReader
 import com.google.zxing.PlanarYUVLuminanceSource
 import com.google.zxing.common.HybridBinarizer
 import com.offlinewallet.ScanPurpose
+import com.offlinewallet.Screen
 import com.offlinewallet.WalletViewModel
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.sin
 
 @Composable
 fun ScanScreen(purpose: ScanPurpose, vm: WalletViewModel) {
@@ -53,13 +74,28 @@ fun ScanScreen(purpose: ScanPurpose, vm: WalletViewModel) {
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted = it }
     LaunchedEffect(Unit) { if (!granted) launcher.launch(Manifest.permission.CAMERA) }
     var manual by remember { mutableStateOf("") }
+    val resumeAfterMiss = remember { AtomicBoolean(false) }
+    val paused = remember { AtomicBoolean(false) }
+    SideEffect { paused.set(vm.broadcasting) }
+    LaunchedEffect(vm.broadcasting) {
+        if (!vm.broadcasting && vm.screen is Screen.Scan && vm.error != null) resumeAfterMiss.set(true)
+    }
     val title = when (purpose) {
         ScanPurpose.ADDRESS -> "扫描地址"
         ScanPurpose.UNSIGNED -> "扫描未签名交易"
         ScanPurpose.SIGNED -> "扫描已签名交易"
     }
     Box(Modifier.fillMaxSize().background(Ink)) {
-        if (granted) CameraPreview(onText = { vm.onScanned(purpose, it) })
+        if (granted) {
+            CameraPreview(paused = paused, resumeAfterMiss = resumeAfterMiss) { text ->
+                playScanCue(context)
+                try {
+                    vm.onScanned(purpose, text)
+                } finally {
+                    if (!vm.broadcasting && vm.screen is Screen.Scan) resumeAfterMiss.set(true)
+                }
+            }
+        }
         Column(Modifier.fillMaxSize().navigationBarsPadding().padding(20.dp)) {
             androidx.compose.foundation.layout.Spacer(Modifier.weight(1f))
             Column(
@@ -77,19 +113,50 @@ fun ScanScreen(purpose: ScanPurpose, vm: WalletViewModel) {
                 Gap(10)
                 WalletField(manual, { manual = it }, "粘贴报文", minLines = 2)
                 Gap(10)
-                PrimaryButton("使用粘贴内容") { vm.onScanned(purpose, manual) }
+                PrimaryButton("使用粘贴内容", enabled = !vm.broadcasting) { vm.onScanned(purpose, manual) }
                 QuietButton("取消", onClick = vm::back)
             }
+        }
+        if (vm.broadcasting) SendingOverlay()
+    }
+}
+
+@Composable
+private fun SendingOverlay() {
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(Ink.copy(alpha = 0.82f))
+            .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {},
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            Modifier
+                .clip(RoundedCornerShape(20.dp))
+                .background(Raised)
+                .padding(horizontal = 36.dp, vertical = 28.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            CircularProgressIndicator(Modifier.size(42.dp), color = Copper, strokeWidth = 3.dp)
+            Gap(16)
+            Text("发送中", color = Ivory, style = MaterialTheme.typography.titleLarge)
+            Gap(6)
+            Body("正在广播这笔交易", Muted)
         }
     }
 }
 
 @Composable
-private fun CameraPreview(onText: (String) -> Unit) {
-    val context = LocalContext.current
+private fun CameraPreview(
+    paused: AtomicBoolean,
+    resumeAfterMiss: AtomicBoolean,
+    onText: (String) -> Unit,
+) {
     val lifecycleOwner = LocalLifecycleOwner.current
     val executor = remember { Executors.newSingleThreadExecutor() }
-    val seen = remember { AtomicBoolean(false) }
+    val gate = remember { AtomicBoolean(true) }
+    val misses = remember { AtomicInteger(0) }
+    val onTextState = rememberUpdatedState(onText)
     DisposableEffect(Unit) { onDispose { executor.shutdown() } }
     AndroidView(
         modifier = Modifier.fillMaxSize(),
@@ -104,9 +171,19 @@ private fun CameraPreview(onText: (String) -> Unit) {
                     .build()
                 analysis.setAnalyzer(executor) { image ->
                     try {
+                        if (paused.get()) return@setAnalyzer
                         val text = decode(image)
-                        if (text != null && seen.compareAndSet(false, true)) {
-                            ContextCompat.getMainExecutor(ctx).execute { onText(text) }
+                        if (text == null) {
+                            if (resumeAfterMiss.get() && misses.incrementAndGet() >= 8) {
+                                resumeAfterMiss.set(false)
+                                misses.set(0)
+                                gate.set(true)
+                            }
+                        } else {
+                            misses.set(0)
+                            if (gate.compareAndSet(true, false)) {
+                                ContextCompat.getMainExecutor(ctx).execute { onTextState.value(text) }
+                            }
                         }
                     } finally {
                         image.close()
@@ -118,6 +195,67 @@ private fun CameraPreview(onText: (String) -> Unit) {
             view
         },
     )
+}
+
+private fun playScanCue(context: Context) {
+    runCatching { vibrate(context) }
+    runCatching { beep() }
+}
+
+private fun vibrate(context: Context) {
+    val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        context.getSystemService(VibratorManager::class.java)?.defaultVibrator
+    } else {
+        context.getSystemService(Vibrator::class.java)
+    } ?: return
+    if (!vibrator.hasVibrator()) return
+    vibrator.vibrate(VibrationEffect.createOneShot(100, VibrationEffect.DEFAULT_AMPLITUDE))
+}
+
+private fun beep() {
+    val sampleRate = 22050
+    val toneFrames = (sampleRate * 0.12).toInt()
+    val minBytes = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT).coerceAtLeast(toneFrames * 2)
+    val frames = minBytes / 2
+    val pcm = ByteArray(frames * 2)
+    for (i in 0 until toneFrames) {
+        val env = when {
+            i < toneFrames * 0.08 -> i / (toneFrames * 0.08)
+            i > toneFrames * 0.7 -> (toneFrames - i) / (toneFrames * 0.3)
+            else -> 1.0
+        }.coerceIn(0.0, 1.0)
+        val sample = (sin(2.0 * Math.PI * 1850.0 * i / sampleRate) * env * 0.8 * 32767.0).toInt()
+        pcm[i * 2] = (sample and 0xff).toByte()
+        pcm[i * 2 + 1] = ((sample shr 8) and 0xff).toByte()
+    }
+    val track = AudioTrack.Builder()
+        .setAudioAttributes(
+            AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build(),
+        )
+        .setAudioFormat(
+            AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(sampleRate)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                .build(),
+        )
+        .setTransferMode(AudioTrack.MODE_STATIC)
+        .setBufferSizeInBytes(pcm.size)
+        .build()
+    try {
+        if (track.write(pcm, 0, pcm.size) < 0) {
+            track.release()
+            return
+        }
+        track.setVolume(1f)
+        track.play()
+        Handler(Looper.getMainLooper()).postDelayed({ runCatching { track.release() } }, 700)
+    } catch (_: Exception) {
+        runCatching { track.release() }
+    }
 }
 
 private fun decode(image: ImageProxy): String? {

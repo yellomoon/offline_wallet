@@ -6,8 +6,12 @@ import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
@@ -27,6 +31,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
@@ -44,6 +49,7 @@ import com.google.zxing.EncodeHintType
 import com.google.zxing.qrcode.QRCodeWriter
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 import com.offlinewallet.BuildConfig
+import com.offlinewallet.UpdateNotice
 import com.offlinewallet.Role
 import com.offlinewallet.ScanPurpose
 import com.offlinewallet.Screen
@@ -61,7 +67,7 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
     ) { vm.back() }
     Box(Modifier.fillMaxSize().background(Ink).statusBarsPadding().navigationBarsPadding().imePadding()) {
         Column(Modifier.fillMaxSize()) {
-            BusyBar(vm.busy, accent)
+            BusyBar(vm.busy || vm.broadcasting, accent)
             when (val screen = vm.screen) {
                 Screen.RolePick -> RoleScreen(vm)
                 Screen.NetworkPick -> NetworkScreen(vm)
@@ -74,6 +80,9 @@ fun WalletApp(vm: WalletViewModel = viewModel()) {
                 Screen.ShowQr -> QrScreen(vm, accent)
                 is Screen.Scan -> ScanScreen(screen.purpose, vm)
                 Screen.Settings -> SettingsScreen(vm)
+                Screen.Nodes -> NodeManageScreen(vm)
+                Screen.Tokens -> TokenManageScreen(vm)
+                Screen.EvmNetworks -> EvmNetworkScreen(vm)
                 Screen.Result -> ResultScreen(vm, accent)
             }
         }
@@ -106,7 +115,7 @@ private fun NetworkScreen(vm: WalletViewModel) {
         Gap(20)
         Headline("先断开网络")
         Gap(8)
-        Body("网络在添加每一把私钥时再选。主网和测试网可以同时留在这台手机上，互不混用。")
+        Body("网络在添加每一把私钥时再选。不同主网可以同时留在这台手机上，互不混用。")
         Gap(18)
         ChoiceCard(
             if (armed) "已关闭网络" else "我已打开飞行模式",
@@ -135,11 +144,11 @@ private fun NetworkScreen(vm: WalletViewModel) {
     }
 }
 
-private fun addressHint(network: CoreNetwork, type: BtcAddressType): String = when (type) {
-    BtcAddressType.P2WPKH -> if (network.testNet) "tb1q…" else "bc1q…"
-    BtcAddressType.P2SH_P2WPKH -> if (network.testNet) "2…" else "3…"
-    BtcAddressType.P2PKH -> if (network.testNet) "m… 或 n…" else "1…"
-    BtcAddressType.P2TR -> if (network.testNet) "tb1p…" else "bc1p…"
+private fun addressHint(testNet: Boolean, type: BtcAddressType): String = when (type) {
+    BtcAddressType.P2WPKH -> if (testNet) "tb1q…" else "bc1q…"
+    BtcAddressType.P2SH_P2WPKH -> if (testNet) "2…" else "3…"
+    BtcAddressType.P2PKH -> if (testNet) "m… 或 n…" else "1…"
+    BtcAddressType.P2TR -> if (testNet) "tb1p…" else "bc1p…"
 }
 
 @Composable
@@ -178,7 +187,7 @@ private fun OfflineHome(vm: WalletViewModel, accent: androidx.compose.ui.graphic
 
 @Composable
 private fun OnlineHome(vm: WalletViewModel, accent: androidx.compose.ui.graphics.Color) {
-    LaunchedEffect(vm.address, vm.network) {
+    LaunchedEffect(vm.address, vm.selectedWire) {
         if (vm.address != null) vm.refresh()
     }
     ScreenColumn {
@@ -220,10 +229,15 @@ private fun OnlineHome(vm: WalletViewModel, accent: androidx.compose.ui.graphics
 private fun ImportKeyScreen(vm: WalletViewModel) {
     var key by remember { mutableStateOf("") }
     var note by remember { mutableStateOf("") }
-    var chosen by remember { mutableStateOf(CoreNetwork.BITCOIN_TESTNET3) }
+    var chosen by remember { mutableStateOf(CoreNetwork.BITCOIN_MAINNET.wire) }
     var kinds by remember { mutableStateOf(setOf(BtcAddressType.P2WPKH)) }
     var preview by remember { mutableStateOf<List<Pair<String, String>>>(emptyList()) }
     var previewError by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(vm.chainChoices) {
+        if (vm.chainChoices.none { it.wire == chosen }) {
+            chosen = vm.chainChoices.firstOrNull()?.wire ?: CoreNetwork.BITCOIN_MAINNET.wire
+        }
+    }
     LaunchedEffect(key, chosen, kinds) {
         if (key.isBlank()) {
             preview = emptyList()
@@ -242,18 +256,14 @@ private fun ImportKeyScreen(vm: WalletViewModel) {
         Gap(8)
         Body("先选这把私钥所属的网络。比特币可以同时勾选多种地址，这些地址共用一个备注。")
         Gap(16)
-        CoreNetwork.entries.forEach { net ->
-            ChoiceCard(net.title, if (net.chain == Chain.BITCOIN) "压缩 WIF" else "64 位十六进制私钥", if (net.testNet) Steel else Copper, chosen == net) {
-                chosen = net
-            }
-            Gap(8)
-        }
-        if (chosen.chain == Chain.BITCOIN) {
+        ChainDropdown("网络", vm.chainChoices, chosen) { chosen = it }
+        val chosenChain = vm.chainChoices.find { it.wire == chosen }
+        if (chosenChain?.chain == Chain.BITCOIN) {
             Gap(8)
             Body("地址类型，可多选")
             Gap(8)
             BtcAddressType.entries.forEach { type ->
-                ChoiceCard(type.title, addressHint(chosen, type), Steel, kinds.contains(type)) {
+                ChoiceCard(type.title, addressHint(chosenChain.testNet, type), Steel, kinds.contains(type)) {
                     kinds = if (kinds.contains(type)) kinds - type else kinds + type
                 }
                 Gap(8)
@@ -283,7 +293,13 @@ private fun ImportKeyScreen(vm: WalletViewModel) {
 private fun ImportAddressScreen(vm: WalletViewModel) {
     var text by remember { mutableStateOf("") }
     var note by remember { mutableStateOf(vm.pendingImportNote) }
-    var chosen by remember { mutableStateOf(vm.pendingImportNetwork) }
+    var chosen by remember { mutableStateOf(vm.pendingImportWire) }
+    LaunchedEffect(vm.chainChoices) {
+        if (vm.chainChoices.none { it.wire == chosen }) {
+            chosen = vm.chainChoices.firstOrNull()?.wire ?: CoreNetwork.BITCOIN_MAINNET.wire
+            vm.pendingImportWire = chosen
+        }
+    }
     ScreenColumn {
         Eyebrow("导入")
         Gap(16)
@@ -291,26 +307,24 @@ private fun ImportAddressScreen(vm: WalletViewModel) {
         Gap(8)
         Body("每个地址属于自己的网络，并带上地址类型和备注。扫到带网络标记的地址码时，以二维码里的网络为准。")
         Gap(16)
-        CoreNetwork.entries.forEach { net ->
-            ChoiceCard(net.title, if (net.testNet) "测试网" else "主网", if (net.testNet) Steel else Copper, chosen == net) {
-                chosen = net
-                vm.pendingImportNetwork = net
-            }
-            Gap(8)
+        ChainDropdown("网络", vm.chainChoices, chosen) {
+            chosen = it
+            vm.pendingImportWire = it
         }
+        Gap(10)
         WalletField(note, { note = it }, "备注，留空则记为账户N")
         Gap(10)
         WalletField(text, { text = it }, "地址或报文", minLines = 3)
         vm.error?.let { Gap(12); Notice(it, Danger) }
         Gap(18)
         PrimaryButton("保存地址") {
-            vm.pendingImportNetwork = chosen
+            vm.pendingImportWire = chosen
             vm.pendingImportNote = note
             vm.importAddress(text, chosen, note)
         }
         Gap(8)
         SecondaryButton("改为扫码") {
-            vm.pendingImportNetwork = chosen
+            vm.pendingImportWire = chosen
             vm.pendingImportNote = note
             vm.openScan(ScanPurpose.ADDRESS)
         }
@@ -323,15 +337,38 @@ private fun SendScreen(vm: WalletViewModel, accent: androidx.compose.ui.graphics
     var to by remember { mutableStateOf("") }
     var amount by remember { mutableStateOf("") }
     var tier by remember { mutableIntStateOf(1) }
-    val unit = vm.network?.unit ?: ""
+    var asset by remember(vm.selectedWire) { mutableStateOf<String?>(null) }
+    val evm = vm.isEvmAccount()
+    val tokens = vm.currentTokens()
+    LaunchedEffect(vm.selectedWire, tokens) {
+        if (asset != null && tokens.none { it.contract == asset }) asset = null
+    }
+    val token = tokens.find { it.contract == asset }
+    val unit = token?.symbol ?: if (evm) vm.nativeCoinSymbol() else vm.network?.unit ?: ""
+    LaunchedEffect(vm.selectedWire, asset, vm.balance) {
+        if (evm) vm.refreshAsset(asset)
+    }
     ScreenColumn {
         Eyebrow("转账")
         Gap(16)
         Headline("填写收款")
         Gap(8)
-        Body("余额 ${vm.balance}")
+        Body("余额 ${if (evm) vm.assetBalance.ifBlank { vm.balance } else vm.balance}")
+        if (evm && vm.assetBalanceNote.isNotBlank()) {
+            Gap(4)
+            Body(vm.assetBalanceNote, Muted)
+        }
         Gap(16)
         WalletField(to, { to = it }, "收款地址", minLines = 2)
+        if (evm) {
+            val options = listOf<Pair<String?, String>>(null to "原生币 ${vm.nativeCoinSymbol()}") +
+                tokens.map { it.contract to "${it.symbol} · ${it.name}" }
+            val selected = options.find { it.first == asset }?.second ?: options.first().second
+            Gap(12)
+            DropdownField("资产类别", selected, options.map { it.second }) { index ->
+                asset = options[index].first
+            }
+        }
         Gap(10)
         WalletField(amount, { amount = it }, "金额（$unit）", keyboardType = KeyboardType.Decimal)
         Gap(16)
@@ -345,7 +382,7 @@ private fun SendScreen(vm: WalletViewModel, accent: androidx.compose.ui.graphics
         }
         vm.error?.let { Notice(it, Danger); Gap(8) }
         Gap(8)
-        PrimaryButton("生成未签名交易", enabled = !vm.busy && vm.tiers.isNotEmpty()) { vm.buildSend(to, amount, tier) }
+        PrimaryButton("生成未签名交易", enabled = !vm.busy && vm.tiers.isNotEmpty()) { vm.buildSend(to, amount, tier, asset) }
         QuietButton("返回", onClick = vm::back)
     }
 }
@@ -454,26 +491,73 @@ private fun SettingsScreen(vm: WalletViewModel) {
         Gap(16)
         Headline("这台设备")
         Gap(12)
-        Slip(
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(20.dp))
+                .background(Raised)
+                .border(1.dp, Line, RoundedCornerShape(20.dp))
+                .padding(horizontal = 18.dp, vertical = 8.dp),
+        ) {
             listOf(
                 "角色" to if (vm.role == Role.OFFLINE) "离线签名" else "在线广播",
                 "运行空间" to vm.spaceLabel,
-                "版本" to BuildConfig.VERSION_NAME,
-            ),
-        )
+            ).forEach { (label, value) ->
+                Column(Modifier.fillMaxWidth().padding(vertical = 10.dp)) {
+                    Text(label, color = Muted, fontSize = 12.sp)
+                    Gap(4)
+                    Text(value, color = Ivory, fontSize = 15.sp)
+                }
+            }
+            Row(
+                Modifier.fillMaxWidth().padding(vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("版本", color = Muted, fontSize = 12.sp)
+                    Gap(4)
+                    Text(BuildConfig.VERSION_NAME, color = Ivory, fontSize = 15.sp)
+                }
+                Text(
+                    if (vm.updateBusy) "正在检查" else "更新",
+                    color = if (vm.updateBusy) Muted else Copper,
+                    fontSize = 14.sp,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.Medium,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(12.dp))
+                        .border(1.dp, if (vm.updateBusy) Line else Copper, RoundedCornerShape(12.dp))
+                        .clickable(enabled = !vm.updateBusy) { vm.checkUpdate() }
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                )
+            }
+        }
+        if (vm.role == Role.OFFLINE) {
+            Gap(22)
+            SecondaryButton("EVM 网络管理") { vm.open(Screen.EvmNetworks) }
+        }
         if (vm.role == Role.ONLINE) {
             Gap(22)
-            Headline("节点")
-            Gap(8)
-            Body("每个网络单独保存。http 和 https 都可以。")
-            CoreNetwork.entries.forEach { net ->
-                EndpointEditor(vm, net)
-            }
+            SecondaryButton("节点管理") { vm.open(Screen.Nodes) }
+            Gap(10)
+            SecondaryButton("代币管理") { vm.open(Screen.Tokens) }
         }
         vm.error?.let { Gap(12); Notice(it, Danger) }
         Gap(12)
         QuietButton("清除本机数据并重选角色", Danger) { confirmReset = true }
         QuietButton("返回", onClick = vm::back)
+    }
+    when (val notice = vm.updateNotice) {
+        null -> Unit
+        UpdateNotice.Latest -> UpdateDialog("当前已是最新版本", "现在用的就是 GitHub 上的最新发布。", "知道了", onConfirm = vm::dismissUpdate, onDismiss = vm::dismissUpdate)
+        is UpdateNotice.Available -> UpdateDialog(
+            "发现新版本 ${notice.release.version.removePrefix("v").removePrefix("V")}",
+            notice.release.notes.ifBlank { "可以下载并安装这个版本。" }.take(400),
+            if (vm.updateBusy) "正在下载" else "更新",
+            enabled = !vm.updateBusy,
+            onConfirm = vm::installUpdate,
+            onDismiss = vm::dismissUpdate,
+        )
+        is UpdateNotice.Failed -> UpdateDialog("更新", notice.message, "知道了", onConfirm = vm::dismissUpdate, onDismiss = vm::dismissUpdate)
     }
     if (confirmReset) {
         AlertDialog(
@@ -489,14 +573,40 @@ private fun SettingsScreen(vm: WalletViewModel) {
     }
 }
 
-private fun accountMatches(account: com.offlinewallet.StoredAccount, index: Int, query: String): Boolean {
+@Composable
+private fun UpdateDialog(
+    title: String,
+    body: String,
+    confirm: String,
+    enabled: Boolean = true,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = { if (enabled) onDismiss() },
+        containerColor = Raised,
+        titleContentColor = Ivory,
+        textContentColor = Dim,
+        title = { Text(title) },
+        text = { Text(body) },
+        confirmButton = {
+            TextButton(onClick = onConfirm, enabled = enabled) { Text(confirm, color = if (enabled) Ivory else Muted) }
+        },
+        dismissButton = {
+            if (confirm == "更新" || confirm == "正在下载") {
+                TextButton(onClick = onDismiss, enabled = enabled) { Text("关闭", color = if (enabled) Ivory else Muted) }
+            }
+        },
+    )
+}
+
+private fun accountMatches(vm: WalletViewModel, account: com.offlinewallet.StoredAccount, index: Int, query: String): Boolean {
     val needle = query.trim()
     if (needle.isEmpty()) return true
-    val type = BtcAddressType.fromWire(account.kind)?.title
-        ?: if (account.networkId()?.chain == Chain.EVM) "以太坊地址" else ""
+    val type = BtcAddressType.fromWire(account.kind)?.title ?: vm.chainTitle(account.network)
     val haystack = listOf(
         account.note ?: "账户${index + 1}",
-        account.caption(),
+        vm.accountCaption(account),
         account.address,
         account.network,
         account.networkId()?.title,
@@ -516,16 +626,16 @@ private fun accountMatches(account: com.offlinewallet.StoredAccount, index: Int,
 private fun AccountList(vm: WalletViewModel, accent: androidx.compose.ui.graphics.Color, offline: Boolean, query: String = "") {
     val clipboard = LocalClipboardManager.current
     var pendingRemove by remember { mutableStateOf<Pair<String, String?>?>(null) }
-    val visible = vm.accounts.withIndex().filter { (index, account) -> accountMatches(account, index, query) }
+    val visible = vm.accounts.withIndex().filter { (index, account) -> accountMatches(vm, account, index, query) }
     if (query.isNotBlank() && visible.isEmpty()) {
         Body("没有匹配的账户")
         Gap(10)
     }
     visible.forEach { (index, account) ->
-        val selected = account.address == vm.address && account.network == vm.network?.wire
+        val selected = vm.isCurrent(account)
         AddressCard(
             label = if (selected) "当前 · ${account.note ?: "账户${index + 1}"}" else (account.note ?: "账户${index + 1}"),
-            detail = account.caption(),
+            detail = vm.accountCaption(account),
             address = account.address,
             accent = accent,
             selected = selected,
@@ -563,15 +673,301 @@ private fun AccountList(vm: WalletViewModel, accent: androidx.compose.ui.graphic
 }
 
 @Composable
-private fun EndpointEditor(vm: WalletViewModel, network: CoreNetwork) {
-    var text by remember(network) { mutableStateOf(vm.endpointOf(network)) }
-    var saved by remember(network) { mutableStateOf(false) }
-    Gap(14)
-    WalletField(text, { text = it; saved = false }, network.title)
-    Gap(8)
-    SecondaryButton(if (saved) "已保存 ${network.title}" else "保存 ${network.title}") {
-        vm.updateEndpoint(network, text)
-        saved = vm.error == null
+private fun ChainDropdown(
+    label: String,
+    choices: List<com.offlinewallet.ChainChoice>,
+    selected: String,
+    onSelect: (String) -> Unit,
+) {
+    if (choices.isEmpty()) return
+    val index = choices.indexOfFirst { it.wire == selected }.let { if (it < 0) 0 else it }
+    val labels = choices.map { if (it.detail.isBlank()) it.title else "${it.title} · ${it.detail}" }
+    DropdownField(label, labels[index], labels) { onSelect(choices[it].wire) }
+}
+
+@Composable
+private fun NodeManageScreen(vm: WalletViewModel) {
+    ScreenColumn {
+        Eyebrow("设置")
+        Gap(16)
+        Headline("节点")
+        Gap(8)
+        Body("先在上面添加网络。下面每张卡片可以改节点地址。http 和 https 都可以。以太坊主网和比特币主网不能删除。")
+        Gap(16)
+        AddEvmCard(vm)
+        Gap(16)
+        NodeCard("Bitcoin 主网", "比特币", vm.endpointOf(CoreNetwork.BITCOIN_MAINNET.wire), null) { _, endpoint ->
+            vm.updateEndpoint(CoreNetwork.BITCOIN_MAINNET.wire, endpoint)
+        }
+        vm.evmChains.forEach { chain ->
+            Gap(10)
+            NodeCard(
+                chain.title,
+                "链 ID ${chain.chainId}",
+                vm.endpointOf(chain.wire),
+                if (chain.wire == CoreNetwork.ETHEREUM_MAINNET.wire) null else ({ vm.deleteEvmChain(chain.wire) }),
+                if (chain.builtin) null else chain.title,
+            ) { name, endpoint ->
+                if (name == null || vm.renameEvmChain(chain.wire, name)) vm.updateEndpoint(chain.wire, endpoint)
+            }
+        }
+        vm.error?.let { Gap(12); Notice(it, Danger) }
+        Gap(12)
+        QuietButton("返回", onClick = vm::back)
+    }
+}
+
+@Composable
+private fun TokenManageScreen(vm: WalletViewModel) {
+    ScreenColumn {
+        Eyebrow("设置")
+        Gap(16)
+        Headline("代币")
+        Gap(8)
+        Body("选择网络和合约地址。添加时从链上读取名称、符号和小数位。")
+        Gap(16)
+        AddTokenCard(vm)
+        if (vm.savedTokens.isEmpty()) {
+            Gap(16)
+            Body("还没有代币。")
+        }
+        vm.savedTokens.forEach { token ->
+            Gap(10)
+            TokenRow(vm, token)
+        }
+        vm.error?.let { Gap(12); Notice(it, Danger) }
+        Gap(12)
+        QuietButton("返回", onClick = vm::back)
+    }
+}
+
+@Composable
+private fun EvmNetworkScreen(vm: WalletViewModel) {
+    ScreenColumn {
+        Eyebrow("设置")
+        Gap(16)
+        Headline("EVM 网络")
+        Gap(8)
+        Body("离线手机不访问节点。添加时只记下名称和 Chain ID，导入私钥时才能选到这条链。")
+        Gap(16)
+        AddOfflineEvmCard(vm)
+        Gap(16)
+        vm.evmChains.forEach { chain ->
+            OfflineChainCard(vm, chain)
+            Gap(10)
+        }
+        vm.error?.let { Gap(12); Notice(it, Danger) }
+        Gap(8)
+        QuietButton("返回", onClick = vm::back)
+    }
+}
+
+@Composable
+private fun OfflineChainCard(vm: WalletViewModel, chain: com.offlinewallet.EvmChainConfig) {
+    var name by remember(chain.wire, chain.title) { mutableStateOf(chain.title) }
+    var confirm by remember { mutableStateOf(false) }
+    val locked = chain.wire == CoreNetwork.ETHEREUM_MAINNET.wire
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(18.dp))
+            .background(Raised)
+            .border(1.dp, Line, RoundedCornerShape(18.dp))
+            .padding(16.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("链 ID ${chain.chainId}", color = Muted, fontSize = 12.sp, modifier = Modifier.weight(1f))
+            if (!locked) {
+                Text("删除", color = Danger, modifier = Modifier.clickable { confirm = true }, fontSize = 14.sp)
+            }
+        }
+        Gap(10)
+        if (locked) {
+            Text(chain.title, color = Ivory, fontSize = 16.sp)
+        } else {
+            WalletField(name, { name = it }, "名称")
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                QuietButton("保存") { vm.renameEvmChain(chain.wire, name) }
+            }
+        }
+    }
+    if (confirm) {
+        AlertDialog(
+            onDismissRequest = { confirm = false },
+            containerColor = Raised,
+            titleContentColor = Ivory,
+            textContentColor = Dim,
+            title = { Text("删除 ${chain.title}") },
+            text = { Text("这个网络上如果还有账户，需要先移除。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirm = false
+                    vm.deleteEvmChain(chain.wire)
+                }) { Text("删除", color = Danger) }
+            },
+            dismissButton = { TextButton(onClick = { confirm = false }) { Text("取消", color = Ivory) } },
+        )
+    }
+}
+
+@Composable
+private fun NodeCard(
+    title: String,
+    subtitle: String,
+    endpoint: String,
+    onDelete: (() -> Unit)?,
+    editableName: String? = null,
+    onSave: (String?, String) -> Unit,
+) {
+    var text by remember(title, endpoint) { mutableStateOf(endpoint) }
+    var name by remember(title, editableName) { mutableStateOf(editableName ?: title) }
+    var confirm by remember { mutableStateOf(false) }
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(18.dp))
+            .background(Raised)
+            .border(1.dp, Line, RoundedCornerShape(18.dp))
+            .padding(16.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                if (editableName == null) Text(title, color = Ivory, fontSize = 16.sp)
+                Text(subtitle, color = Muted, fontSize = 12.sp)
+            }
+            if (onDelete != null) {
+                Text("删除", color = Danger, modifier = Modifier.clickable { confirm = true }, fontSize = 14.sp)
+            }
+        }
+        Gap(10)
+        if (editableName != null) {
+            WalletField(name, { name = it }, "名称")
+            Gap(8)
+        }
+        WalletField(text, { text = it }, "节点")
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+            QuietButton("保存") { onSave(if (editableName == null) null else name, text) }
+        }
+    }
+    if (confirm && onDelete != null) {
+        AlertDialog(
+            onDismissRequest = { confirm = false },
+            containerColor = Raised,
+            titleContentColor = Ivory,
+            textContentColor = Dim,
+            title = { Text("删除 $title") },
+            text = { Text("这个网络上的代币也会一起去掉。上面如果还有账户，需要先移除。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirm = false
+                    onDelete()
+                }) { Text("删除", color = Danger) }
+            },
+            dismissButton = { TextButton(onClick = { confirm = false }) { Text("取消", color = Ivory) } },
+        )
+    }
+}
+
+@Composable
+private fun AddOfflineEvmCard(vm: WalletViewModel) {
+    var title by remember(vm.networkFormEpoch) { mutableStateOf("") }
+    var chainId by remember(vm.networkFormEpoch) { mutableStateOf("") }
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(18.dp))
+            .background(Raised)
+            .border(1.dp, Line, RoundedCornerShape(18.dp))
+            .padding(16.dp),
+    ) {
+        Text("添加 EVM 网络", color = Ivory, fontSize = 16.sp)
+        Gap(10)
+        WalletField(title, { title = it }, "名称，例如 BNB Chain")
+        Gap(8)
+        WalletField(chainId, { chainId = it }, "Chain ID", keyboardType = KeyboardType.Number)
+        Gap(12)
+        PrimaryButton("添加网络", enabled = !vm.busy) { vm.addOfflineEvmChain(title, chainId) }
+    }
+}
+
+@Composable
+private fun AddEvmCard(vm: WalletViewModel) {
+    var title by remember(vm.networkFormEpoch) { mutableStateOf("") }
+    var chainId by remember(vm.networkFormEpoch) { mutableStateOf("") }
+    var endpoint by remember(vm.networkFormEpoch) { mutableStateOf("") }
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(18.dp))
+            .background(Raised)
+            .border(1.dp, Line, RoundedCornerShape(18.dp))
+            .padding(16.dp),
+    ) {
+        Text("添加 EVM 网络", color = Ivory, fontSize = 16.sp)
+        Gap(10)
+        WalletField(title, { title = it }, "名称，例如 Polygon")
+        Gap(8)
+        WalletField(chainId, { chainId = it }, "Chain ID", keyboardType = KeyboardType.Number)
+        Gap(8)
+        WalletField(endpoint, { endpoint = it }, "节点")
+        Gap(12)
+        PrimaryButton(if (vm.busy) "正在核对链 ID" else "添加网络", enabled = !vm.busy) {
+            vm.addEvmChain(title, chainId, endpoint)
+        }
+    }
+}
+
+@Composable
+private fun AddTokenCard(vm: WalletViewModel) {
+    var wire by remember { mutableStateOf(CoreNetwork.ETHEREUM_MAINNET.wire) }
+    var contract by remember(vm.tokenFormEpoch) { mutableStateOf("") }
+    LaunchedEffect(vm.evmChains) {
+        if (vm.evmChains.none { it.wire == wire }) wire = vm.evmChains.firstOrNull()?.wire ?: wire
+    }
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(18.dp))
+            .background(Raised)
+            .border(1.dp, Line, RoundedCornerShape(18.dp))
+            .padding(16.dp),
+    ) {
+        Text("添加代币", color = Ivory, fontSize = 16.sp)
+        Gap(10)
+        val chains = vm.evmChains
+        if (chains.isNotEmpty()) {
+            val index = chains.indexOfFirst { it.wire == wire }.let { if (it < 0) 0 else it }
+            val labels = chains.map { "${it.title} · 链 ID ${it.chainId}" }
+            DropdownField("网络", labels[index], labels) { wire = chains[it].wire }
+            Gap(8)
+        }
+        WalletField(contract, { contract = it }, "合约地址")
+        Gap(12)
+        PrimaryButton(if (vm.busy) "正在读取" else "添加", enabled = !vm.busy && contract.isNotBlank()) {
+            vm.addToken(wire, contract)
+        }
+    }
+}
+
+@Composable
+private fun TokenRow(vm: WalletViewModel, token: com.offlinewallet.SavedToken) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(18.dp))
+            .background(Raised)
+            .border(1.dp, Line, RoundedCornerShape(18.dp))
+            .padding(16.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("${token.symbol} · ${token.name}", color = Ivory, fontSize = 16.sp)
+                Text("${vm.chainTitle(token.network)} · ${token.decimals} 位小数", color = Muted, fontSize = 12.sp)
+            }
+            Text("删除", color = Danger, modifier = Modifier.clickable { vm.removeToken(token.network, token.contract) }, fontSize = 14.sp)
+        }
+        Gap(8)
+        Text(displayAddress(token.contract), color = Dim, fontFamily = Mono, fontSize = 13.sp, lineHeight = 18.sp)
     }
 }
 

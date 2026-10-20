@@ -16,13 +16,23 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MenuAnchorType
+import androidx.compose.material3.MenuDefaults
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -186,6 +196,52 @@ fun Slip(lines: List<Pair<String, String>>) {
                     fontSize = 15.sp,
                     lineHeight = 22.sp,
                     modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun DropdownField(label: String, value: String, options: List<String>, onSelect: (Int) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
+        OutlinedTextField(
+            value = value,
+            onValueChange = {},
+            readOnly = true,
+            label = { Text(label) },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
+            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable).fillMaxWidth(),
+            shape = RoundedCornerShape(14.dp),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = Ivory,
+                unfocusedBorderColor = Line,
+                focusedTextColor = Ivory,
+                unfocusedTextColor = Ivory,
+                focusedLabelColor = Dim,
+                unfocusedLabelColor = Muted,
+                focusedContainerColor = Raised,
+                unfocusedContainerColor = Raised,
+                focusedTrailingIconColor = Ivory,
+                unfocusedTrailingIconColor = Dim,
+            ),
+        )
+        ExposedDropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+            containerColor = Raised,
+            shape = RoundedCornerShape(14.dp),
+        ) {
+            options.forEachIndexed { index, option ->
+                DropdownMenuItem(
+                    text = { Text(option, color = Ivory) },
+                    onClick = {
+                        onSelect(index)
+                        expanded = false
+                    },
+                    colors = MenuDefaults.itemColors(textColor = Ivory),
                 )
             }
         }

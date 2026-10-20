@@ -5,10 +5,13 @@ import com.offlinewallet.core.NetworkId
 import com.offlinewallet.core.Utxo
 import com.offlinewallet.core.WalletException
 import com.offlinewallet.core.ethChainId
+import com.offlinewallet.core.evmGasTiers
 import com.offlinewallet.core.formatBalance
 import com.offlinewallet.core.formatBtc
 import com.offlinewallet.core.formatGwei
 import com.offlinewallet.core.formatSats
+import com.offlinewallet.core.hexToBytes
+import com.offlinewallet.core.nativeUnit
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -26,6 +29,13 @@ data class FeeChoice(
     val btcRate: Double = 0.0,
     val tip: BigInteger = BigInteger.ZERO,
     val maxFee: BigInteger = BigInteger.ZERO,
+)
+
+data class Erc20Token(
+    val contract: String,
+    val name: String,
+    val symbol: String,
+    val decimals: Int,
 )
 
 data class ChainSnapshot(
@@ -46,7 +56,26 @@ class ChainApi(rawEndpoint: String) {
 
     fun load(network: NetworkId, address: String): ChainSnapshot = when (network.chain) {
         Chain.BITCOIN -> loadBitcoin(address)
-        Chain.EVM -> loadEthereum(address, network)
+        Chain.EVM -> loadEthereum(address, network.ethChainId())
+    }
+
+    fun loadEvm(chainId: Long, address: String): ChainSnapshot = loadEthereum(address, chainId)
+
+    fun evmChainId(): Long = hexQty(rpcString("eth_chainId", JSONArray())).toLong()
+
+    fun tokenBalance(contract: String, holder: String): BigInteger {
+        val who = com.offlinewallet.core.normalizeEthAddress(holder).removePrefix("0x").lowercase().padStart(64, '0')
+        return com.offlinewallet.core.Erc20.decodeUint(ethCall(com.offlinewallet.core.normalizeEthAddress(contract), "70a08231$who"))
+    }
+
+    fun readErc20(contract: String): Erc20Token {
+        val address = com.offlinewallet.core.normalizeEthAddress(contract)
+        val name = com.offlinewallet.core.Erc20.decodeString(ethCall(address, com.offlinewallet.core.Erc20.NAME))
+        val symbol = com.offlinewallet.core.Erc20.decodeString(ethCall(address, com.offlinewallet.core.Erc20.SYMBOL))
+        val decimals = com.offlinewallet.core.Erc20.decodeUint(ethCall(address, com.offlinewallet.core.Erc20.DECIMALS)).toInt()
+        if (decimals !in 0..36) throw WalletException("小数位数不合理")
+        if (name.isBlank() || symbol.isBlank()) throw WalletException("合约没有返回名称或符号")
+        return Erc20Token(address, name, symbol, decimals)
     }
 
     fun broadcastBitcoin(rawHex: String): String = postText("$endpoint/tx", rawHex)
@@ -89,14 +118,14 @@ class ChainApi(rawEndpoint: String) {
         )
     }
 
-    private fun loadEthereum(address: String, network: NetworkId): ChainSnapshot {
-        val chainId = hexQty(rpcString("eth_chainId", JSONArray())).toLong()
-        if (chainId != network.ethChainId()) throw WalletException("节点 chainId 是 $chainId，和所选网络不一致")
+    private fun loadEthereum(address: String, expectedChainId: Long): ChainSnapshot {
+        val chainId = evmChainId()
+        if (chainId != expectedChainId) throw WalletException("节点 chainId 是 $chainId，和所选网络不一致")
         val wei = hexQty(rpcString("eth_getBalance", JSONArray().put(address).put("latest")))
         val nonce = hexQty(rpcString("eth_getTransactionCount", JSONArray().put(address).put("pending"))).toLong()
         val fees = ethFees()
         return ChainSnapshot(
-            primary = "${formatBalance(wei, 18)} ETH",
+            primary = "${formatBalance(wei, 18)} ${nativeUnit(expectedChainId)}",
             secondary = "下一笔 nonce $nonce",
             tiers = fees,
             utxos = emptyList(),
@@ -118,28 +147,44 @@ class ChainApi(rawEndpoint: String) {
     }
 
     private fun ethFees(): List<FeeChoice> {
-        val (base, tip) = try {
-            val params = JSONArray().put("0x5").put("latest").put(JSONArray().put(50))
-            val result = rpc("eth_feeHistory", params).getJSONObject("result")
-            val bases = result.getJSONArray("baseFeePerGas")
-            val base = hexQty(bases.getString(bases.length() - 1))
-            val rewards = result.optJSONArray("reward")
-            val tip = if (rewards != null && rewards.length() > 0) {
-                hexQty(rewards.getJSONArray(rewards.length() - 1).getString(0))
-            } else {
-                BigInteger.valueOf(1_000_000_000)
-            }
-            base to tip.coerceAtLeast(BigInteger.valueOf(1_000_000_000))
+        val quoted = try {
+            hexQty(rpcString("eth_gasPrice", JSONArray()))
+        } catch (_: Exception) {
+            BigInteger.ZERO
+        }
+        val sample = try {
+            readFeeSample()
+        } catch (_: Exception) {
+            null
+        }
+        if (quoted.signum() == 0 && (sample == null || sample.first.signum() == 0)) {
+            throw WalletException("节点没有返回 gas 价格")
+        }
+        return evmGasTiers(quoted, sample?.first ?: BigInteger.ZERO, sample?.second ?: BigInteger.ZERO).map { tier ->
+            val text = "${formatGwei(tier.maxFee)} Gwei"
+            val detail = if (tier.label == "标准") "当前网络 $text" else text
+            FeeChoice(tier.label, detail, tip = tier.tip, maxFee = tier.maxFee)
+        }
+    }
+
+    private fun readFeeSample(): Pair<BigInteger, BigInteger> {
+        val percentiles = JSONArray().put(90)
+        val result = try {
+            rpc("eth_feeHistory", JSONArray().put("0x14").put("pending").put(percentiles)).getJSONObject("result")
         } catch (_: WalletException) {
-            val gas = hexQty(rpcString("eth_gasPrice", JSONArray()))
-            BigInteger.ZERO to gas.coerceAtLeast(BigInteger.valueOf(1_000_000_000))
+            rpc("eth_feeHistory", JSONArray().put("0x14").put("latest").put(percentiles)).getJSONObject("result")
         }
-        fun choice(label: String, tipMul: Long, baseMul: Long): FeeChoice {
-            val priority = tip.multiply(BigInteger.valueOf(tipMul))
-            val max = base.multiply(BigInteger.valueOf(baseMul)).add(priority).max(priority)
-            return FeeChoice(label, "最高 ${formatGwei(max)} Gwei", tip = priority, maxFee = max)
+        val bases = result.getJSONArray("baseFeePerGas")
+        val base = if (bases.length() == 0) BigInteger.ZERO else hexQty(bases.getString(bases.length() - 1))
+        val rewards = result.optJSONArray("reward")
+        val tips = ArrayList<BigInteger>()
+        if (rewards != null) {
+            for (i in 0 until rewards.length()) {
+                val row = rewards.optJSONArray(i) ?: continue
+                if (row.length() > 0) tips += hexQty(row.getString(0))
+            }
         }
-        return listOf(choice("经济", 1, 1), choice("标准", 1, 2), choice("优先", 2, 2))
+        return base to medianWei(tips)
     }
 
     private fun get(url: String): String {
@@ -154,6 +199,14 @@ class ChainApi(rawEndpoint: String) {
             .post(body.toRequestBody("text/plain".toMediaType()))
             .build()
         return execute(request).trim()
+    }
+
+    private fun ethCall(contract: String, selector: String): ByteArray {
+        val call = JSONObject().put("to", contract).put("data", "0x$selector")
+        val result = rpcString("eth_call", JSONArray().put(call).put("latest"))
+        val hex = result.removePrefix("0x").removePrefix("0X")
+        if (hex.isEmpty()) throw WalletException("合约没有返回数据")
+        return hex.hexToBytes()
     }
 
     private fun rpcString(method: String, params: JSONArray): String = rpc(method, params).get("result").asRpcString()
@@ -192,6 +245,12 @@ class ChainApi(rawEndpoint: String) {
             throw WalletException("节点返回了无法识别的内容")
         }
     }
+}
+
+private fun medianWei(values: List<BigInteger>): BigInteger {
+    if (values.isEmpty()) return BigInteger.ZERO
+    val sorted = values.sorted()
+    return sorted[sorted.size / 2]
 }
 
 private fun pickRate(map: Map<Int, Double>, target: Int): Double {

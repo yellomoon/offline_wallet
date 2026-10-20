@@ -39,7 +39,7 @@ fun formatBtc(sats: Long): String = formatMinor(BigInteger.valueOf(sats), 8)
 fun formatEth(wei: BigInteger): String = formatMinor(wei, 18)
 
 fun formatGwei(wei: BigInteger): String {
-    val gwei = BigDecimal(wei).divide(BigDecimal("1000000000"), 4, RoundingMode.HALF_UP).stripTrailingZeros()
+    val gwei = BigDecimal(wei).divide(BigDecimal("1000000000"), 9, RoundingMode.HALF_UP).stripTrailingZeros()
     return gwei.toPlainString()
 }
 
